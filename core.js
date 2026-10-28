@@ -1,6 +1,5 @@
 (() => {
   'use strict';
-
   function start(bridge) {
     const q = (s, node = document) => node.querySelector(s);
     const all = (s, node = document) => Array.from(node.querySelectorAll(s));
@@ -85,9 +84,11 @@
 
     function field(text, control, hint = '') {
       if (!control.id) control.id = 'dp-field-' + ++serial;
+      const toggle = ['checkbox', 'radio'].includes(control.type);
       if (!control.className)
-        control.className =
-          control.tagName === 'SELECT'
+        control.className = toggle
+          ? 'dp-toggle'
+          : control.tagName === 'SELECT'
             ? 'dp-select'
             : control.tagName === 'TEXTAREA'
               ? 'dp-area'
@@ -97,7 +98,7 @@
       if (hint) control.setAttribute('aria-describedby', control.id + '-hint');
       return el(
         'label',
-        { class: 'dp-field', for: control.id },
+        { class: 'dp-field' + (toggle ? ' dp-switch' : ''), for: control.id },
         el('span', { class: 'dp-label', id: name, text }),
         control,
         hint ? el('span', { class: 'dp-help', id: control.id + '-hint', text: hint }) : null
@@ -312,8 +313,11 @@
         if (json) {
           const data = await response.json();
           if (!context()) throw new Error('Zmieniono konto lub świat. Odśwież stronę.');
-          if (data?.error === 'wrong world' || data?.message === 'wrong world')
-            throw new Error('Zmieniono świat w sesji. Odśwież stronę.');
+          if (data?.world && String(data.world).toLowerCase() !== world.toLowerCase())
+            throw new Error('Odpowiedź pochodzi z innego świata. Odśwież stronę.');
+          if (data?.message === 'wrong world') throw new Error('Zmieniono świat w sesji. Odśwież stronę.');
+          if (data?.error)
+            throw new Error('Nie udało się odczytać danych. Sprawdź sesję i dostęp do modułu.');
           return data;
         }
         const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
@@ -349,6 +353,57 @@
         type: String(data.type || 'number').slice(0, 20)
       };
       store.set('aliases', entries);
+    }
+
+    function entity(kind, id, href = '') {
+      if (!routes[kind] || !/^\d+$/.test(String(id)) || Number(id) <= 0) return '';
+      try {
+        const target = new URL(href || url(routes[kind] + id), location.origin);
+        const match = target.pathname.match(/^\/world(?::([^/]+))?\/(.*)$/);
+        if (target.origin !== location.origin || target.username || target.password || !match) return '';
+        if (match[1] && decodeURIComponent(match[1]).toLowerCase() !== world.toLowerCase()) return '';
+        if (match[2].replace(/\/$/, '') !== routes[kind] + id) return '';
+        return new URL(url(routes[kind] + id), location.origin).href;
+      } catch {
+        return '';
+      }
+    }
+
+    async function search(kind, id) {
+      const category = { npc: 'npcs', mob: 'mobs', map: 'maps', item: 'templates', player: 'players' }[kind];
+      if (!category || !/^\d+$/.test(String(id)) || Number(id) <= 0) return [];
+      const query = new URLSearchParams({
+        t: 'panel_search',
+        token: String(acc().token),
+        world,
+        q: String(id),
+        category,
+        page: '1'
+      });
+      const data = await request('/ajax.php?' + query, true);
+      if (!data || !Array.isArray(data.groups)) throw new Error('Wyszukiwanie nie zwróciło listy obiektów.');
+      if (Array.isArray(data.allowed) && !data.allowed.includes(category))
+        throw new Error('Nie masz dostępu do tego katalogu.');
+      if (Array.isArray(data.unavailable) && data.unavailable.includes(category))
+        throw new Error('Katalog jest chwilowo niedostępny.');
+      return data.groups
+        .filter((group) => group?.category === category)
+        .flatMap((group) => (Array.isArray(group.results) ? group.results : []))
+        .filter(
+          (record) =>
+            record &&
+            String(record.id) === String(id) &&
+            typeof record.url === 'string' &&
+            record.url &&
+            entity(kind, id, record.url)
+        )
+        .map((record) => ({
+          id: String(id),
+          name: clean(record.name || '#' + id),
+          src: imageUrl(record.icon),
+          href: entity(kind, id, record.url),
+          origin: 'wyszukiwarka panelu'
+        }));
     }
 
     function refs(doc, scope) {
@@ -405,6 +460,8 @@
       };
       const selectors = {
         npc: 'select.chosen-npc option',
+        mob: 'select.chosen-mob option',
+        map: 'select.chosen-map option',
         shop: 'select.chosen-shop option',
         item: 'select[name="template"] option, select[name="tid"] option',
         player: 'select[name="aids[]"] option, select[name="players[]"] option',
@@ -467,7 +524,7 @@
           try {
             const raw = link.getAttribute('href');
             if (raw.startsWith('#') || raw.endsWith('#') || link.matches('[data-toggle="dropdown"]')) return;
-            const href = new URL(raw, location.origin);
+            const href = new URL(raw, sources.get(doc) || location.href);
             if (href.origin !== location.origin) return;
             const own = href.pathname.match(/^\/world:([^/]+)/);
             if (own && decodeURIComponent(own[1]).toLowerCase() !== world.toLowerCase()) return;
@@ -482,8 +539,10 @@
                 id: match[1],
                 name: text || '#' + match[1],
                 origin: quest ? 'Questlog' : 'powiązanie',
-                quest
+                quest,
+                href: entity(kind, match[1], href.href)
               });
+            else if (!old.href) old.href = entity(kind, match[1], href.href);
           } catch {}
         });
       if (kind === 'progress') {
@@ -499,7 +558,10 @@
       const entries = Array.from(records.values());
       if (!['progress', 'quest'].includes(kind)) {
         app.media.collect(doc, kind, sources.get(doc) || location.href);
-        return app.media.enrich(entries, kind);
+        return app.media.enrich(
+          entries.map((record) => ({ ...record, href: record.href || entity(kind, record.id) })),
+          kind
+        );
       }
       return entries.map((record) => ({ ...record, scope }));
     }
@@ -521,7 +583,7 @@
       if (!context()) throw new Error('Zmieniono konto lub świat. Odśwież stronę.');
       const scope = options.scope === 'global' ? 'global' : 'player';
       const key = kind === 'progress' ? kind + ':' + scope : kind;
-      if (cache.has(key)) return merge(read(document, kind, scope), cache.get(key));
+      if (cache.has(key)) return app.media.enrich(merge(read(document, kind, scope), cache.get(key)), kind);
       if (pending.has(key)) return pending.get(key);
       const job = (async () => {
         let entries = read(document, kind, scope);
@@ -534,7 +596,7 @@
                 entries,
                 app.media
                   .enrich(
-                    data.filter((row) => row && /^-?\d+$/.test(String(row.id))),
+                    data.filter((row) => row && /^-?\d+$/.test(String(row.id)) && Number(row.id) > 0),
                     kind
                   )
                   .map((row) => ({
@@ -542,13 +604,22 @@
                     name: clean(row.name || '#' + row.id),
                     src: row.src,
                     frame: row.frame,
+                    href: entity(kind, row.id, row.url || row.href),
+                    group: clean(row.group || ''),
                     origin: kind === 'quest' ? 'Questlog' : 'panel',
                     quest: kind === 'quest'
                   }))
               );
           } catch {}
         }
-        const routes = { item: 'items/template', quest: 'quest', npc: 'npc', shop: 'shop' };
+        const routes = {
+          item: 'items/template',
+          quest: 'quest',
+          npc: 'npc',
+          mob: 'mobs',
+          map: 'maps',
+          shop: 'shop'
+        };
         if (kind === 'progress' && scope === 'player') {
           try {
             entries = merge(entries, read(await request(url('progress')), kind, scope));
@@ -559,7 +630,12 @@
               (await list('quest')).map((record) => ({ ...record, scope, quest: true, origin: 'Questlog' }))
             );
           } catch {}
-        } else if (routes[kind] && (['item', 'npc', 'quest'].includes(kind) || !entries.length)) {
+        } else if (
+          routes[kind] &&
+          (['item', 'npc', 'quest'].includes(kind) ||
+            !entries.length ||
+            (['mob', 'map'].includes(kind) && entries.some((record) => !record.src)))
+        ) {
           try {
             entries = merge(entries, read(await request(url(routes[kind])), kind, scope));
           } catch {}
@@ -796,7 +872,7 @@
           });
           const img = ['progress', 'quest'].includes(kind)
             ? el('span', { class: 'dp-item-symbol', text: '#', 'aria-hidden': 'true' })
-            : app.media.node(record);
+            : app.media.node(record, { kind });
           const use = button(
             '',
             () => {
@@ -936,7 +1012,7 @@
                   el('p', { class: 'dp-help', text: label + ' · #' + record.id + ' · ' + world })
                 );
                 if (!['progress', 'quest'].includes(kind))
-                  detail.body.append(app.media.node(record, { size: 96 }));
+                  detail.body.append(app.media.node(record, { size: 96, kind }));
                 if (kind === 'progress') {
                   detail.body.append(
                     el('p', {
@@ -1241,11 +1317,12 @@
           button('Odśwież katalog', () => {
             cache.clear();
             stageCache.clear();
+            app.media.clear?.();
             note('Katalog zostanie odczytany ponownie przy otwarciu.');
           }),
           button('Ustawienia', settings)
         ),
-        el('small', { class: 'dp-help', text: '0.2.0 · Alt+Shift+D · zmiany zapisujesz w panelu' })
+        el('small', { class: 'dp-help', text: '0.3.0 · Alt+Shift+D · zmiany zapisujesz w panelu' })
       );
       dock.append(panel, toggle);
       root.append(dock);
@@ -1270,6 +1347,7 @@
       note,
       pick,
       list,
+      search,
       stages,
       aliases,
       alias,
@@ -1311,6 +1389,14 @@
   function media(app) {
     const { q, all, el } = app;
     const saved = new Map();
+    const pending = new Map();
+    const checked = new Map();
+    const objects = new WeakMap();
+    const watched = new Map();
+    const queue = [];
+    let observer;
+    let active = 0;
+    let generation = 0;
     const paths = {
       npc: /\/npc\/(\d+)(?:\/|$)/,
       mob: /\/mobs\/(\d+)(?:\/|$)/,
@@ -1374,7 +1460,31 @@
         if (target.origin !== location.origin) return '';
         const world = target.pathname.match(/^\/world:([^/]+)/);
         if (world && decodeURIComponent(world[1]).toLowerCase() !== app.world.toLowerCase()) return '';
-        return target.pathname.match(paths[kind])?.[1] || '';
+        const path = target.pathname.replace(/^\/world(?::[^/]+)?/, '');
+        const match = path.match(paths[kind]);
+        return match?.[0] === path ? match[1] : '';
+      } catch {
+        return '';
+      }
+    }
+
+    function detail(record, kind) {
+      if (!paths[kind] || !record.href) return '';
+      try {
+        const target = new URL(record.href, location.href);
+        if (
+          target.origin !== location.origin ||
+          target.search ||
+          target.hash ||
+          target.username ||
+          target.password
+        )
+          return '';
+        const world = target.pathname.match(/^\/world:([^/]+)/);
+        if (!world || decodeURIComponent(world[1]).toLowerCase() !== app.world.toLowerCase()) return '';
+        const path = target.pathname.slice(world[0].length);
+        const match = path.match(paths[kind]);
+        return match?.[0] === path && match[1] === String(record.id) ? target.href : '';
       } catch {
         return '';
       }
@@ -1423,6 +1533,49 @@
       return background(node, kind, base);
     }
 
+    function data(doc) {
+      const found = { ...objects.get(doc) };
+      if (doc === document) {
+        for (const name of ['map', 'npc_drags']) {
+          const value = app.page?.[name];
+          if (value && typeof value === 'object' && !value.nodeType) found[name] = value;
+        }
+      }
+      if (objects.has(doc)) return found;
+      for (const script of all('script:not([src])', doc)) {
+        const text = script.textContent;
+        const starts = /(?:^|[;\r\n])\s*(?:var|let|const)\s+(map|npc_drags)\s*=\s*([\[{])/g;
+        let match;
+        while ((match = starts.exec(text))) {
+          if (found[match[1]]) continue;
+          const start = starts.lastIndex - 1;
+          let depth = 0;
+          let quote = false;
+          let escape = false;
+          for (let i = start; i < text.length; i++) {
+            const char = text[i];
+            if (quote) {
+              if (escape) escape = false;
+              else if (char === '\\') escape = true;
+              else if (char === '"') quote = false;
+            } else if (char === '"') quote = true;
+            else if (char === '{' || char === '[') depth++;
+            else if (char === '}' || char === ']') {
+              depth--;
+              if (depth) continue;
+              try {
+                found[match[1]] = JSON.parse(text.slice(start, i + 1));
+              } catch {}
+              starts.lastIndex = i + 1;
+              break;
+            }
+          }
+        }
+      }
+      objects.set(doc, found);
+      return found;
+    }
+
     function collect(doc, kind, base = doc.baseURI || location.href) {
       const out = new Map();
       if (!paths[kind]) return [];
@@ -1430,6 +1583,39 @@
         const row = remember(id, data, kind);
         if (row) out.set(row.id, row);
       };
+      const source = data(doc);
+      if (kind === 'map' && source.map?.id) {
+        const map = source.map;
+        add(map.id, visual({ src: map.nimg || map.file }, kind, base));
+      }
+      if (kind === 'mob' && source.npc_drags && typeof source.npc_drags === 'object') {
+        Object.entries(source.npc_drags).forEach(([id, row]) => add(id, visual(row, kind, base)));
+      }
+      if ((kind === 'npc' || kind === 'mob') && source.map?.npc && typeof source.map.npc === 'object') {
+        Object.values(source.map.npc).forEach((row) => {
+          if (row && (row._type === 'mob' ? 'mob' : 'npc') === kind) add(row.id, visual(row, kind, base));
+        });
+      }
+      const choice = {
+        npc: '.chosen-npc',
+        mob: '.chosen-mob',
+        map: '.chosen-map, .chosen-map-with-id',
+        item: '.chosen-template, .chosen-template-any'
+      }[kind];
+      if (choice)
+        all(choice, doc).forEach((select) =>
+          all('option', select).forEach((option) => {
+            add(
+              option.value,
+              picture(option, kind, base) ||
+                visual(
+                  { src: option.getAttribute('data-src') || option.getAttribute('data-icon') },
+                  kind,
+                  base
+                )
+            );
+          })
+        );
       if (kind === 'item')
         all('[tip]', doc).forEach((node) => {
           try {
@@ -1445,7 +1631,7 @@
         const image = q('img[src]', link);
         if (!data && image) data = picture(image, kind, base);
         if (!data) {
-          const row = link.closest('li, tr');
+          const row = link.closest('li, tr') || link.parentElement;
           if (row) {
             const ids = new Set();
             all('a[href]', row).forEach((other) =>
@@ -1497,11 +1683,124 @@
         const own = visual(record, kind);
         const old = saved.get(kind + ':' + record.id);
         const data = own ? { ...own, frame: own.frame || (old?.src === own.src ? old.frame : null) } : old;
+        if (data) remember(record.id, data, kind);
         return { ...record, src: data?.src || '', frame: data?.frame || null };
       });
     }
 
-    function node(record, { size = 56 } = {}) {
+    function run(job) {
+      return new Promise((resolve, reject) => {
+        queue.push({ job, resolve, reject });
+        drain();
+      });
+    }
+
+    function drain() {
+      while (active < 4 && queue.length) {
+        const item = queue.shift();
+        active++;
+        Promise.resolve()
+          .then(item.job)
+          .then(item.resolve, item.reject)
+          .finally(() => {
+            active--;
+            drain();
+          });
+      }
+    }
+
+    async function resolve(record, kind) {
+      const id = String(record?.id || '');
+      if (!paths[kind] || !/^\d+$/.test(id) || Number(id) <= 0) return { ...record, media: 'missing' };
+      collect(document, kind, location.href);
+      const current = enrich([record], kind)[0];
+      if (current.src) return { ...current, media: 'ready' };
+      const key = kind + ':' + id;
+      const last = checked.get(key);
+      if (last && Date.now() - last.time < 30000) return { ...record, media: last.media };
+      if (pending.has(key)) return pending.get(key).then((data) => ({ ...record, ...data }));
+      const version = generation;
+      const stale = () => ({ ...record, media: 'missing', stale: true });
+      const job = run(async () => {
+        if (version !== generation) return stale();
+        let row = current;
+        let failed = false;
+        let read = false;
+        if (app.search && kind !== 'shop') {
+          try {
+            const results = await app.search(kind, id);
+            if (version !== generation) return stale();
+            read = true;
+            const match = results.find((item) => String(item.id) === id);
+            if (match) row = { ...row, ...match };
+            row = enrich([row], kind)[0];
+          } catch {
+            failed = true;
+          }
+        }
+        if (version !== generation) return stale();
+        const href = detail(row, kind);
+        if (!row.src && href && app.get && kind !== 'shop') {
+          try {
+            const doc = await app.get(href);
+            if (version !== generation) return stale();
+            read = true;
+            collect(doc, kind, href);
+            row = enrich([row], kind)[0];
+          } catch {
+            failed = true;
+          }
+        }
+        if (version !== generation) return stale();
+        const state = row.src ? 'ready' : failed && !read ? 'error' : 'missing';
+        checked.set(key, { time: Date.now(), media: state });
+        return { ...row, media: state };
+      });
+      pending.set(key, job);
+      try {
+        return await job;
+      } finally {
+        if (pending.get(key) === job) pending.delete(key);
+      }
+    }
+
+    function clear() {
+      generation++;
+      saved.clear();
+      pending.clear();
+      checked.clear();
+      for (const [node] of watched) {
+        if (node.isConnected) continue;
+        observer?.unobserve(node);
+        watched.delete(node);
+      }
+    }
+
+    function watch(node, load) {
+      queueMicrotask(() => {
+        if (!node.isConnected) return;
+        if (typeof IntersectionObserver !== 'function') return load();
+        for (const [old] of watched) {
+          if (old.isConnected) continue;
+          observer?.unobserve(old);
+          watched.delete(old);
+        }
+        if (!observer)
+          observer = new IntersectionObserver((entries) => {
+            for (const entry of entries) {
+              if (!entry.isIntersecting && entry.target.isConnected) continue;
+              const run = watched.get(entry.target);
+              observer.unobserve(entry.target);
+              watched.delete(entry.target);
+              if (entry.isIntersecting) run?.();
+            }
+          });
+        watched.set(node, load);
+        observer.observe(node);
+      });
+    }
+
+    function node(record, { size = 56, kind = '' } = {}) {
       size = Math.min(256, Math.max(16, Number(size) || 56));
       const box = el('span', {
         class: 'dp-media',
@@ -1510,60 +1809,91 @@
       });
       box.style.width = size + 'px';
       box.style.height = size + 'px';
-      const fallback = () => {
+      const fallback = (state = 'missing') => {
+        const labels = {
+          missing: 'Brak podglądu',
+          error: 'Odczyt niedostępny',
+          image: 'Błąd grafiki',
+          loading: 'Wczytywanie'
+        };
+        const messages = {
+          missing: 'Panel nie udostępnił adresu grafiki tego obiektu.',
+          error: 'Nie udało się odczytać grafiki. Odśwież katalog, aby spróbować ponownie.',
+          image: 'Nie udało się wczytać pliku grafiki.',
+          loading: 'Pobieranie adresu grafiki z bieżącego świata.'
+        };
         box.classList.add('dp-media-empty');
-        box.setAttribute('aria-label', 'Brak grafiki');
-        box.replaceChildren(el('span', { text: 'Brak grafiki' }));
+        box.classList.remove('dp-media-ready');
+        box.setAttribute('aria-label', labels[state]);
+        box.setAttribute('aria-busy', String(state === 'loading'));
+        box.setAttribute('title', messages[state]);
+        box.replaceChildren(el('span', { text: labels[state] }));
       };
-      const data = visual(record, '');
-      if (!data) {
-        fallback();
-        return box;
-      }
-      const crop = el('span', { class: 'dp-media-frame' });
-      const image = el('img', {
-        class: 'dp-media-img',
-        alt: '',
-        loading: 'lazy',
-        decoding: 'async',
-        referrerpolicy: 'no-referrer'
-      });
-      crop.style.width = size + 'px';
-      crop.style.height = size + 'px';
-      image.style.opacity = '0';
-      image.addEventListener('error', fallback, { once: true });
-      image.addEventListener(
-        'load',
-        () => {
-          const originalWidth = image.naturalWidth;
-          const originalHeight = image.naturalHeight;
-          if (!originalWidth || !originalHeight) return fallback();
-          const cut = data.frame;
-          const width = cut?.width || originalWidth / (cut?.cols || 1);
-          const height = cut?.height || originalHeight / (cut?.rows || 1);
-          const x = cut?.x || 0;
-          const y = cut?.y || 0;
-          if (width + x > originalWidth || height + y > originalHeight) return fallback();
-          const scale = Math.min(2, size / width, size / height);
-          crop.style.width = width * scale + 'px';
-          crop.style.height = height * scale + 'px';
-          image.style.width = originalWidth * scale + 'px';
-          image.style.height = originalHeight * scale + 'px';
-          image.style.maxWidth = 'none';
-          image.style.maxHeight = 'none';
-          image.style.transform = `translate(${-x * scale}px, ${-y * scale}px)`;
-          image.style.opacity = '1';
-          box.classList.add('dp-media-ready');
-        },
-        { once: true }
-      );
-      crop.append(image);
-      box.append(crop);
-      image.src = data.src;
+      const paint = (data) => {
+        const crop = el('span', { class: 'dp-media-frame' });
+        const image = el('img', {
+          class: 'dp-media-img',
+          alt: '',
+          loading: 'lazy',
+          decoding: 'async',
+          referrerpolicy: 'no-referrer'
+        });
+        crop.style.width = size + 'px';
+        crop.style.height = size + 'px';
+        box.setAttribute('aria-busy', 'true');
+        image.style.opacity = '0';
+        image.addEventListener('error', () => fallback('image'), { once: true });
+        image.addEventListener(
+          'load',
+          () => {
+            const originalWidth = image.naturalWidth;
+            const originalHeight = image.naturalHeight;
+            if (!originalWidth || !originalHeight) return fallback('image');
+            const cut = data.frame;
+            const width = cut?.width || originalWidth / (cut?.cols || 1);
+            const height = cut?.height || originalHeight / (cut?.rows || 1);
+            const x = cut?.x || 0;
+            const y = cut?.y || 0;
+            if (width + x > originalWidth || height + y > originalHeight) return fallback('image');
+            const scale = Math.min(2, size / width, size / height);
+            crop.style.width = width * scale + 'px';
+            crop.style.height = height * scale + 'px';
+            image.style.width = originalWidth * scale + 'px';
+            image.style.height = originalHeight * scale + 'px';
+            image.style.maxWidth = 'none';
+            image.style.maxHeight = 'none';
+            image.style.transform = `translate(${-x * scale}px, ${-y * scale}px)`;
+            image.style.opacity = '1';
+            box.classList.remove('dp-media-empty');
+            box.classList.add('dp-media-ready');
+            box.setAttribute('aria-busy', 'false');
+            box.setAttribute('aria-label', record?.name ? 'Grafika: ' + record.name : 'Grafika obiektu');
+            box.removeAttribute('title');
+          },
+          { once: true }
+        );
+        crop.append(image);
+        box.replaceChildren(crop);
+        image.src = data.src;
+      };
+      const known = visual(enrich([record], kind)[0], kind);
+      if (known) paint(known);
+      else if (paths[kind] && kind !== 'shop' && record?.id && (app.search || detail(record, kind))) {
+        fallback('loading');
+        const load = async () => {
+          if (!box.isConnected) return;
+          const result = await resolve(record, kind);
+          if (!box.isConnected || result.stale) return;
+          const data = visual(result, kind);
+          if (data) paint(data);
+          else fallback(result.media);
+        };
+        watch(box, load);
+      } else fallback();
       return box;
     }
 
-    return { collect, enrich, node };
+    return { collect, enrich, node, resolve, clear };
   }
 
   function dialogs(app) {
@@ -1606,6 +1936,1618 @@
     const textLine = (text) => String(text).replace(/\r\n|\r|\n/g, '<br>');
     const int = (text) => /^-?\d+$/.test(String(text)) && Number.isSafeInteger(Number(text));
     const natural = (text) => int(text) && Number(text) >= 0;
+
+    const catalog = new Map();
+    const f = (key, label, type, extra = {}) => ({ key, label, type, ...extra });
+    const n = (key, label, extra) => f(key, label, 'number', extra);
+    const id = (key, label, kind = 'item', extra) => f(key, label, 'entity', { kind, ...extra });
+    const ids = (key, label, kind = 'item', extra) => f(key, label, 'entities', { kind, ...extra });
+    const txt = (key, label, extra) => f(key, label, 'text', extra);
+    const enumField = (key, label, values, extra) => f(key, label, 'enum', { values, ...extra });
+    const add = (cmd, label, group, fields, route, help, module = 'dialogi') =>
+      catalog.set(cmd, { cmd, label, group, fields, route, help, module });
+    const pg = (global = false) =>
+      id('id', global ? 'Progress globalny' : 'Progress gracza', 'progress', {
+        scope: global ? 'global' : 'player',
+        signed: true
+      });
+    const modules = 'przedmioty w dialogach';
+    const pets = modules + ' i zwierzaki';
+    for (const global of [false, true]) {
+      const name = global ? 'GPROGRESS' : 'PROGRESS';
+      add(
+        name,
+        global ? 'Zapisz progress świata' : 'Zapisz progress gracza',
+        'Progressy',
+        [pg(global), f('value', 'Nowa wartość albo zmiana o 1', 'state')],
+        'next',
+        'Liczba zastępuje wartość. ++ dodaje 1, -- odejmuje 1. Także zapis tej samej wartości odświeża datę zmiany.'
+      );
+      add(
+        'IF' + name,
+        global ? 'Sprawdź progress świata' : 'Sprawdź progress gracza',
+        'Warunki',
+        [pg(global), f('value', 'Wymagana wartość', 'range')],
+        'pair',
+        'Sprawdza wartość lub zakres, a następnie wybiera jedną z dwóch dróg.'
+      );
+    }
+    add(
+      'CHANGE',
+      'Oblicz i zapisz progress',
+      'Progressy',
+      [
+        f('left', 'Zmieniany progress', 'destination'),
+        enumField('method', 'Działanie', [
+          ['=', 'Ustaw'],
+          ['+', 'Dodaj'],
+          ['-', 'Odejmij'],
+          ['*', 'Pomnóż'],
+          ['/', 'Podziel']
+        ]),
+        f('value', 'Wartość działania', 'operand')
+      ],
+      'next',
+      'Zmienia poprzednią wartość wybranego progressu. Wartością może być inny progress, data, stan waluty lub losowana liczba. Wynik dzielenia jest całkowity.'
+    );
+    add(
+      'IF',
+      'Porównaj dwie wartości',
+      'Warunki',
+      [
+        f('left', 'Lewa wartość', 'operand'),
+        enumField('method', 'Porównanie', [
+          ['=', 'Równe'],
+          ['!=', 'Różne'],
+          ['>', 'Większe'],
+          ['<', 'Mniejsze'],
+          ['>=', 'Co najmniej'],
+          ['<=', 'Najwyżej']
+        ]),
+        f('value', 'Prawa wartość', 'operand')
+      ],
+      'pair',
+      'Porównuje liczby, progressy, datę, walutę, poziom, przedmioty lub wolne miejsca. Liczby wpisane bezpośrednio muszą być nieujemne.'
+    );
+    add(
+      'IFTIME',
+      'Sprawdź czas od zapisu progressu',
+      'Warunki',
+      [pg(), n('minutes', 'Liczba minut')],
+      'pair',
+      'Warunek jest spełniony po upływie więcej niż podana liczba minut od ostatniego zapisu. Nigdy niezapisany progress prowadzi do gałęzi „nie”.'
+    );
+    add(
+      'RESET_PROGRESS_LAST_DAY',
+      'Wyzeruj progress z poprzedniego dnia',
+      'Progressy',
+      [pg(), f('value', 'Wartość do wyzerowania', 'integer')],
+      'next',
+      'Zeruje progress, gdy ma podaną wartość i zapis pochodzi z innego dnia. Parametr wartości 0 nie wykonuje resetu ani przejścia. Numer 0 ma niejednoznaczny opis w dokumentacji.'
+    );
+    add(
+      'RANKING',
+      'Pokaż ranking progressu',
+      'Progressy',
+      [pg(), n('count', 'Liczba miejsc')],
+      '',
+      'Dopisuje do wypowiedzi ranking kont z najwyższą wartością tego progressu.'
+    );
+    add(
+      'GO',
+      'Przejdź do kroku',
+      'Rozmowa',
+      [],
+      'next',
+      'Przechodzi do wybranego kroku albo kończy rozmowę.'
+    );
+    add(
+      'RAND',
+      'Wylosuj dalszy krok',
+      'Rozmowa',
+      [f('targets', 'Możliwe kroki', 'targets')],
+      'random',
+      'Losuje jeden numer z listy. Powtórzony numer zwiększa jego szansę.'
+    );
+    add(
+      'GONPC',
+      'Przekaż rozmowę innemu NPC',
+      'Rozmowa',
+      [id('npc', 'NPC', 'npc'), n('step', 'Numer kroku u tego NPC', { min: 1 })],
+      'foreign',
+      'NPC docelowy musi być włączony i żywy. Nie jest sprawdzana odległość. Numer kroku należy do jego dialogu.'
+    );
+    add(
+      'MESSAGE',
+      'Wyświetl żółtą wiadomość',
+      'Rozmowa',
+      [txt('text', 'Treść wiadomości', { rest: true })],
+      '',
+      'Dopisuje wiadomość na ekranie. W tym komunikacie nie działają znaczniki wartości progressu ani losowej liczby.'
+    );
+    add(
+      'NEWQUEST',
+      'Pokaż napis o rozpoczęciu questa',
+      'Rozmowa',
+      [],
+      '',
+      'Wyświetla tylko „Rozpoczęto quest!”; nie zapisuje progressu. Etap zadania zapisuje osobne działanie na progressie.'
+    );
+    add(
+      'END',
+      'Zakończ rozmowę',
+      'Rozmowa',
+      [],
+      'close',
+      'Zamyka rozmowę. Tekst tego kroku nie zostanie wyświetlony.'
+    );
+    add('SHAKE', 'Wstrząśnij ekranem', 'Rozmowa', [], '', 'Wstrząsa ekranem; używaj raz w kroku.');
+    add(
+      'F5',
+      'Odśwież grę',
+      'Rozmowa',
+      [],
+      '',
+      'Przeładowuje grę, na przykład po zmianie mapy przez progress -2182 lub -1.'
+    );
+    for (const [cmd, label, help] of [
+      [
+        'IFITEM',
+        'Sprawdź przedmioty',
+        'Wymaga po jednej sztuce każdego szablonu w torbie. Powtórzony numer wymaga kolejnego przedmiotu.'
+      ],
+      [
+        'IFITEMDEL',
+        'Sprawdź i zabierz całe przedmioty',
+        'Zabiera po jednym całym przedmiocie każdego szablonu. Cały stos znika ze wszystkimi sztukami; torba z zawartością jest pomijana.'
+      ],
+      [
+        'IFBAGROOM',
+        'Sprawdź miejsce w torbie',
+        'Istniejący stos szablonu nie potrzebuje miejsca. Pozycja „nowe wolne miejsce” zapisuje 0 i wymaga nowego miejsca.'
+      ]
+    ])
+      add(
+        cmd,
+        label,
+        'Przedmioty',
+        [ids('items', 'Szablony przedmiotów', 'item', { zero: cmd === 'IFBAGROOM' })],
+        'pair',
+        help,
+        modules
+      );
+    add(
+      'IFITEMADD',
+      'Daj nowy przedmiot',
+      'Przedmioty',
+      [id('item', 'Szablon przedmiotu')],
+      'pair',
+      'Tworzy nowy przedmiot na wolnym miejscu. Ilość pochodzi z szablonu. Nie dokłada do istniejącego stosu.',
+      modules
+    );
+    add(
+      'IFITEMAMOUNTDEL',
+      'Zabierz sztuki z jednego stosu',
+      'Przedmioty',
+      [id('item', 'Szablon przedmiotu'), n('amount', 'Liczba sztuk', { min: 1 })],
+      'pair',
+      'Wymaga podanej liczby sztuk w jednym stosie. Nie sumuje wielu stosów.',
+      modules
+    );
+    add(
+      'ITEMAMOUNTADD',
+      'Dodaj sztuki do stosu',
+      'Przedmioty',
+      [id('item', 'Szablon przedmiotu'), n('amount', 'Liczba sztuk', { min: 1 })],
+      'either',
+      'Dokłada do pierwszego stosu; jeśli go nie ma, tworzy nowy. Wariant z dwiema drogami obsługuje brak miejsca.',
+      modules
+    );
+    add('DEPO', 'Otwórz depozyt', 'Przedmioty', [], '', 'Otwiera depozyt dodatku.', 'przedmioty');
+    for (const second of [false, true]) {
+      const cmd = second ? 'CASH2' : 'CASH';
+      add(
+        cmd,
+        second ? 'Dodaj lub zabierz drugą walutę' : 'Dodaj lub zabierz walutę',
+        'Waluta',
+        [
+          f('amount', 'Liczba monet', 'integer'),
+          txt('text', 'Opis do historii waluty', { rest: true, optional: true })
+        ],
+        '',
+        'Liczba dodatnia dodaje, ujemna zabiera. Pobranie nie sprawdza salda i może zostawić dług; wcześniej użyj warunku stanu waluty.' +
+          (second ? ' Zapis drugiej waluty wymaga modułu waluty; warunek wymaga modułu drugiej waluty.' : ''),
+        'waluta'
+      );
+      add(
+        'IF' + cmd,
+        second ? 'Sprawdź drugą walutę' : 'Sprawdź stan waluty',
+        'Warunki',
+        [n('amount', 'Wymagany stan')],
+        'pair',
+        'Warunek spełniony, gdy stan konta wynosi co najmniej podaną liczbę.',
+        second ? 'druga waluta' : 'waluta'
+      );
+    }
+    add(
+      'IFAID',
+      'Sprawdź konto gracza',
+      'Warunki',
+      [ids('accounts', 'Dozwolone konta', 'player')],
+      'pair',
+      'Porównuje numery kont AID, a nie numery postaci.'
+    );
+    add(
+      'IFHOUR',
+      'Sprawdź godzinę',
+      'Warunki',
+      [n('start', 'Godzina od', { max: 24 }), n('end', 'Godzina do', { max: 24 })],
+      'pair',
+      'Czas polski. Obie pełne godziny są wliczone; zakres 22–2 przechodzi przez północ. Godzina 24 oznacza 0.'
+    );
+    add(
+      'IFNPC',
+      'Sprawdź zajęcie kratki przez NPC',
+      'Warunki',
+      [id('map', 'Mapa', 'map'), n('x', 'Pozycja x'), n('y', 'Pozycja y')],
+      'pair',
+      'Warunek spełniony, jeśli na tej kratce stoi włączony NPC.'
+    );
+    add(
+      'HIDENPC',
+      'Ukryj NPC dla tego gracza',
+      'NPC i mapa',
+      [],
+      '',
+      'Ukrywa rozmawiającego NPC do odświeżenia gry.'
+    );
+    add(
+      'KILLNPC',
+      'Ukryj NPC dla wszystkich na minuty',
+      'NPC i mapa',
+      [n('time', 'Liczba minut')],
+      '',
+      'NPC znika wszystkim graczom na podany czas.'
+    );
+    add(
+      'KILL_S_NPC',
+      'Ukryj NPC dla wszystkich na sekundy',
+      'NPC i mapa',
+      [n('time', 'Liczba sekund')],
+      '',
+      'NPC znika wszystkim graczom na podany czas.'
+    );
+    add(
+      'TRIP',
+      'Przenieś NPC',
+      'NPC i mapa',
+      [
+        id('map', 'Mapa docelowa', 'map'),
+        txt('name', 'Nazwa mapy'),
+        n('x', 'Pozycja x'),
+        n('y', 'Pozycja y')
+      ],
+      'pipeNext',
+      'Przenosi NPC, z którym trwa rozmowa. Nowe położenie jest od razu wspólne dla wszystkich.'
+    );
+    add(
+      'CREATENPC',
+      'Utwórz NPC w grze',
+      'NPC i mapa',
+      [
+        txt('name', 'Nazwa NPC'),
+        txt('description', 'Opis NPC', { optional: true }),
+        txt('image', 'Adres grafiki'),
+        n('width', 'Szerokość klatki', { min: 1 }),
+        n('height', 'Wysokość klatki', { min: 1 }),
+        id('map', 'Mapa', 'map'),
+        txt('mapname', 'Nazwa mapy'),
+        n('x', 'Pozycja x'),
+        n('y', 'Pozycja y'),
+        n('days', 'Liczba dni')
+      ],
+      'pipePair',
+      '0 dni oznacza bez końca. Zajęta pozycja kieruje do drugiej gałęzi. W opisie działają %nick%, %today%, %hour%, %valid%. Dalsza rozmowa jest podpisana nazwą nowego NPC.'
+    );
+    add(
+      'CAMERA',
+      'Pokaż innego NPC na ekranie',
+      'NPC i mapa',
+      [id('npc', 'NPC', 'npc'), txt('name', 'Podpis wypowiedzi', { rest: true })],
+      '',
+      'NPC musi być na tej samej mapie co gracz. Podpis jest obowiązkowy.'
+    );
+    add(
+      'LOCATE_NPC',
+      'Pokaż położenie i odrodzenie NPC',
+      'NPC i mapa',
+      [id('npc', 'NPC', 'npc')],
+      '',
+      'Dopisuje do wypowiedzi mapę NPC i stan jego odrodzenia.'
+    );
+    add(
+      'LOCATE_MOB',
+      'Pokaż położenie i odrodzenie potwora',
+      'NPC i mapa',
+      [id('mob', 'Potwór', 'mob')],
+      '',
+      'Dopisuje do wypowiedzi mapę potwora i stan jego odrodzenia.'
+    );
+    for (const [cmd, label] of [
+      ['ADDCOL', 'Dodaj kolizje'],
+      ['DELCOL', 'Usuń kolizje']
+    ])
+      add(
+        cmd,
+        label,
+        'NPC i mapa',
+        [f('tiles', 'Kratki na bieżącej mapie', 'tiles')],
+        '',
+        'Zmiana kolizji działa do odświeżenia gry. Każdą kratkę wybierz przez współrzędne x i y.'
+      );
+    add(
+      'KILLPLAYER',
+      'Ogłusz gracza',
+      'Gracz',
+      [n('time', 'Liczba sekund')],
+      '',
+      'Gracz pozostaje nieprzytomny przez podaną liczbę sekund.'
+    );
+    add(
+      'OUTFIT',
+      'Zmień wygląd gracza',
+      'Gracz',
+      [txt('path', 'Ścieżka stroju')],
+      '',
+      'Ścieżka grafiki postaci, np. spec/beczka.gif. Wartość „-” przywraca własny wygląd.'
+    );
+    add(
+      'AWARD',
+      'Przyznaj nagrodę',
+      'Gracz',
+      [
+        enumField('type', 'Rodzaj nagrody', [
+          ['neon', 'Neon — adres grafiki'],
+          ['nick', 'Kolor nicku'],
+          ['chat', 'Kolor czatu'],
+          ['rank', 'Fraza przed nickiem'],
+          ['podpis', 'Podpis']
+        ]),
+        txt('value', 'Wartość nagrody'),
+        n('days', 'Liczba dni'),
+        txt('comment', 'Komentarz', { optional: true })
+      ],
+      'pipeNext',
+      'Nagroda zapisuje się zawsze. Gracze widzą ją w grze, gdy świat ma moduł nagród.',
+      'nagrody'
+    );
+    add(
+      'SHOP',
+      'Otwórz sklep',
+      'Gracz',
+      [id('shop', 'Sklep', 'shop')],
+      'close',
+      'Otwiera sklep o wybranym ID i zamyka rozmowę.',
+      'sklepy'
+    );
+    add(
+      'BATTLE',
+      'Rozpocznij walkę',
+      'Gracz',
+      [id('mob', 'Potwór', 'mob')],
+      'close',
+      'Potwór jest wzorcem walki, łupu i progressów; na mapie nie znika. NPC znika na czas odrodzenia tego potwora. Bez modułu walk jest szybka, zawsze wygrana walka.'
+    );
+    add(
+      'EMO',
+      'Pokaż emocję',
+      'Gracz',
+      [
+        enumField(
+          'name',
+          'Emocja',
+          'fireworks fire_1 fire_2 fire_3 fire_4 fire_5 fire_6 fire_7 fire_8 fire_9 lampion gift roza stars banki emonutki emosnow ghost bat spider angry away battle frnd kiss kiss2 lvlup login respawned teleported stasis'
+            .split(' ')
+            .map((name) => [name, name])
+        ),
+        enumField(
+          'target',
+          'Nad kim',
+          [
+            ['', 'Nad NPC'],
+            ['gracz', 'Nad graczem']
+          ],
+          { optional: true }
+        )
+      ],
+      '',
+      'Emocję widzi tylko ten gracz. Do pięciu emocji w jednym kroku.'
+    );
+    add(
+      'IFPETLVL',
+      'Sprawdź poziom zwierzaka',
+      'Zwierzaki i krainy',
+      [
+        n('level', 'Wymagany poziom'),
+        id('item', 'Szablon zwierzaka (opcjonalnie)', 'item', { optional: true })
+      ],
+      'pair',
+      'Sprawdza najlepszego zwierzaka; po wskazaniu szablonu tylko najlepszego z tego szablonu.',
+      modules
+    );
+    add(
+      'PETTIER',
+      'Przemień zwierzaka',
+      'Zwierzaki i krainy',
+      [id('old', 'Obecny szablon'), id('new', 'Nowy szablon')],
+      'pair',
+      'Zachowuje poziom, doświadczenie i ekwipunek.',
+      modules
+    );
+    add(
+      'IFPETSKILL',
+      'Sprawdź wybór umiejętności',
+      'Zwierzaki i krainy',
+      [
+        ids('items', 'Szablony zwierzaka'),
+        n('slot', 'Miejsce na umiejętność', { min: 1 }),
+        f('skill', 'Rodzaj sprawdzenia', 'skill')
+      ],
+      'pair',
+      '„Wolne” sprawdza pierwszą naukę, „dowolny” istniejący wybór, a numer wskazuje umiejętność do zmiany.',
+      pets
+    );
+    add(
+      'PETSKILL',
+      'Naucz umiejętności',
+      'Zwierzaki i krainy',
+      [
+        ids('items', 'Szablony zwierzaka'),
+        n('slot', 'Miejsce na umiejętność', { min: 1 }),
+        n('skill', 'Numer umiejętności', { min: 1 }),
+        f('paid', 'Zmiana wcześniejszego wyboru', 'paid', { optional: true })
+      ],
+      'pair',
+      'Oznaczenie PAID pozwala zmienić wcześniejszy wybór. Opłatę pobiera osobny wcześniejszy krok.',
+      pets
+    );
+    add(
+      'IFCAMP',
+      'Sprawdź poziom obozu',
+      'Zwierzaki i krainy',
+      [n('level', 'Wymagany poziom')],
+      'pair',
+      'Warunek spełniony, gdy obóz ma co najmniej podany poziom.',
+      pets
+    );
+    add(
+      'GATHER',
+      'Zbieranie rośliny',
+      'Zwierzaki i krainy',
+      [
+        id('item', 'Dawany przedmiot'),
+        f('amount', 'Liczba sztuk', 'amount'),
+        n('minutes', 'Odrost w minutach')
+      ],
+      'close',
+      'Daje przedmiot, zamyka rozmowę i ukrywa roślinę dla tego gracza na podaną liczbę minut.',
+      pets
+    );
+    add(
+      'DIG',
+      'Kopanie skały lub żyły',
+      'Zwierzaki i krainy',
+      [
+        n('hardness', 'Twardość', { min: 1, max: 3 }),
+        id('item', 'Dawany przedmiot'),
+        f('amount', 'Liczba sztuk za rozbicie', 'amount'),
+        n('charges', 'Liczba rozbić', { min: 1 }),
+        n('minutes', 'Odrost w minutach'),
+        f('water', 'Wymagaj wody krainy', 'water', { optional: true }),
+        n('xp', 'Doświadczenie zwierzaków (%)', { optional: true, min: 1, max: 1000 })
+      ],
+      'close',
+      'Potrzebny kilof. Po zużyciu ładunków miejsce znika dla tego gracza. Odrost 0 oznacza na zawsze. Woda jest zabierana przed kopaniem.',
+      pets
+    );
+    add(
+      'BUILD',
+      'Otwórz osobistą budowę',
+      'Zwierzaki i krainy',
+      [n('level', 'Poziom budowy')],
+      'close',
+      'Poziomy i materiały określa kraina.',
+      pets
+    );
+    add(
+      'COOL',
+      'Schłodź zwierzaki',
+      'Zwierzaki i krainy',
+      [n('heat', 'Najwyższy pozostały żar')],
+      '',
+      'Obniża żar drużyny najwyżej do tej wartości. 0 chłodzi całkowicie.',
+      pets
+    );
+    add(
+      'PETXP',
+      'Daj zwierzakom doświadczenie',
+      'Zwierzaki i krainy',
+      [n('percent', 'Procent doświadczenia', { min: 1, max: 1000 })],
+      '',
+      '100 odpowiada jednej walce na poziomie zwierzaka. Działa w krainie; forma na maksymalnym poziomie nie dostaje doświadczenia.',
+      pets
+    );
+    add(
+      'IFCLOCK',
+      'Sprawdź fazę zegara krainy',
+      'Zwierzaki i krainy',
+      [txt('clock', 'Nazwa zegara'), f('phases', 'Dozwolone fazy', 'names')],
+      'pair',
+      'Nazwę zegara i jego fazy określa kraina. Warunek odnosi się do krainy, w której stoi gracz.',
+      'dialogi i zwierzaki'
+    );
+    add(
+      'SMITH',
+      'Otwórz kucie krainy',
+      'Zwierzaki i krainy',
+      [txt('station', 'Stanowisko (opcjonalnie)', { optional: true })],
+      'close',
+      'Nazwa stanowiska ustalona przez krainę zawęża listę przepisów.',
+      pets
+    );
+    for (const [cmd, label] of [
+      ['UPGRADE', 'Otwórz ulepszanie ekwipunku'],
+      ['FORGE', 'Otwórz przekuwanie'],
+      ['SKILLRANK', 'Otwórz rangi umiejętności'],
+      ['CRAFT', 'Otwórz warzenie przy ognisku'],
+      ['CAMP', 'Otwórz rozbudowę obozu'],
+      ['PORTAL', 'Otwórz Portal Krain']
+    ])
+      add(
+        cmd,
+        label,
+        'Zwierzaki i krainy',
+        [],
+        'close',
+        'Otwiera odpowiednie okno i zamyka rozmowę.',
+        cmd === 'PORTAL' ? modules : pets
+      );
+
+    function validArg(field, value) {
+      value = String(value ?? '');
+      if (!value) return !!field.optional;
+      if (/[\r\n]|(^|\s)#/.test(value) || (field.reply && /[\[\]]/.test(value))) return false;
+      if (/^\$[^$\s]+\$$/.test(value)) return true;
+      const dynamic = /^\[(?:PVAL|PGVAL|PROGRESS|GPROGRESS):-?\d+(?:\+\d+)?\]$|^\[RAND:\d+:\d+\]$/.test(
+        value
+      );
+      if (/^\[RAND:/.test(value)) {
+        const bounds = value.match(/^\[RAND:(\d+):(\d+)\]$/);
+        if (!bounds || Number(bounds[1]) > Number(bounds[2])) return false;
+      }
+      if (dynamic && !['text', 'enum', 'paid', 'water', 'targets', 'tiles'].includes(field.type)) return true;
+      if (field.type === 'entity')
+        return (
+          (field.signed ? int(value) : natural(value)) && (field.zero || field.signed || Number(value) > 0)
+        );
+      if (field.type === 'entities')
+        return value.split(',').every((part) => natural(part) && (field.zero || Number(part) > 0));
+      if (field.type === 'number')
+        return (
+          natural(value) &&
+          Number(value) >= (field.min ?? 0) &&
+          Number(value) <= (field.max ?? Number.MAX_SAFE_INTEGER)
+        );
+      if (field.type === 'integer') return int(value);
+      if (field.type === 'state')
+        return (
+          (/^[+-]?\d+$/.test(value) && Number.isSafeInteger(Number(value))) ||
+          value === '++' ||
+          value === '--'
+        );
+      if (field.type === 'range') return range(value);
+      if (field.type === 'amount')
+        return (
+          natural(value) ||
+          (/^\d+-\d+$/.test(value) && Number(value.split('-')[0]) <= Number(value.split('-')[1]))
+        );
+      if (field.type === 'operand')
+        return (
+          operand(value).valid &&
+          (!value.startsWith('RAND:') || Number(value.split(':')[1]) <= Number(value.split(':')[2]))
+        );
+      if (field.type === 'destination') return /^G?PROGRESS:-?\d+$/.test(value);
+      if (field.type === 'enum') return field.values.some(([key]) => String(key) === value);
+      if (field.type === 'skill') return ['free', 'any'].includes(value) || natural(value);
+      if (field.type === 'paid') return value === 'PAID';
+      if (field.type === 'water') return value === 'WATER';
+      if (field.type === 'tiles') return /^(\d+,\d+)( \d+,\d+)*$/.test(value);
+      if (field.type === 'targets')
+        return /^\d+( \d+)*$/.test(value) && value.split(' ').every((part) => Number(part) > 0);
+      if (field.type === 'names') return /^[^\s,|]+(,[^\s,|]+)*$/.test(value);
+      return !value.includes('|');
+    }
+
+    function decode(raw) {
+      const cmd = raw.match(/^#([A-Z][A-Z0-9_]*)\b/)?.[1];
+      const spec = catalog.get(cmd);
+      if (!spec) return null;
+      let body = raw.slice(cmd.length + 1).trim();
+      const result = { cmd, values: {}, yes: '', no: '', valid: true, raw };
+      const fail = () => {
+        result.valid = false;
+        return result;
+      };
+      if (spec.route === 'pipeNext' || spec.route === 'pipePair') {
+        const parts = body.split('|');
+        const count = spec.route === 'pipePair' ? 2 : 1;
+        if (parts.length !== spec.fields.length + count) return fail();
+        if (count === 2) result.no = parts.pop().match(/^->(\S+)$/)?.[1] || '';
+        result.yes = parts.pop().match(/^->(\S+)$/)?.[1] || '';
+        spec.fields.forEach((field, index) => {
+          result.values[field.key] = parts[index];
+        });
+      } else {
+        if (['pair', 'next', 'either'].includes(spec.route)) {
+          const pair = body.match(/(?:^|\s)THEN\s+->(\S+)\s+ELSE\s+->(\S+)$/);
+          const single = body.match(/(?:^|\s)->(\S+)$/);
+          if (pair && spec.route !== 'next') {
+            result.yes = pair[1];
+            result.no = pair[2];
+            body = body.slice(0, pair.index).trimEnd();
+          } else if (single && spec.route !== 'pair') {
+            result.yes = single[1];
+            body = body.slice(0, single.index).trimEnd();
+          } else return fail();
+        }
+        if (cmd === 'GONPC') {
+          const match = body.match(/^(\S+)\s+->(\S+)$/);
+          if (!match) return fail();
+          result.values = { npc: match[1], step: match[2] };
+        } else if (cmd === 'DIG') {
+          const match = body.match(/^(\S+)\s+(\S+);(\S+)\s+(\S+)\s+(\S+)(?:\s+(WATER))?(?:\s+XP=(\S+))?$/);
+          if (!match) return fail();
+          spec.fields.forEach((field, index) => {
+            result.values[field.key] = match[index + 1] || '';
+          });
+        } else if (spec.fields.length === 1 && ['targets', 'tiles'].includes(spec.fields[0].type))
+          result.values[spec.fields[0].key] = body;
+        else {
+          let rest = body;
+          spec.fields.forEach((field) => {
+            if (field.rest) {
+              result.values[field.key] = rest;
+              rest = '';
+            } else {
+              const match = rest.match(/^(\S+)(?:\s+|$)/);
+              result.values[field.key] = match?.[1] || '';
+              rest = match ? rest.slice(match[0].length) : rest;
+            }
+          });
+          if (rest) return fail();
+        }
+      }
+      result.valid = spec.fields.every((field) => validArg(field, result.values[field.key]));
+      if (result.yes && !/^(\d+|END)$/.test(result.yes)) result.valid = false;
+      if (result.no && !/^(\d+|END)$/.test(result.no)) result.valid = false;
+      return result;
+    }
+
+    function encode(cmd, values, yes = '', no = '') {
+      const spec = catalog.get(cmd);
+      if (!spec) throw new Error('Wybierz działanie.');
+      for (const field of spec.fields)
+        if (!validArg(field, values[field.key])) throw new Error('Uzupełnij poprawnie: ' + field.label + '.');
+      if (cmd === 'CHANGE' && values.method === '/' && natural(values.value) && Number(values.value) === 0)
+        throw new Error('Nie można dzielić przez 0.');
+      if (cmd === 'RESET_PROGRESS_LAST_DAY' && (Number(values.value) === 0 || Number(values.id) === 0))
+        throw new Error('Wybierz niezerowy numer i wartość dla resetu dziennego.');
+      if (['pair', 'next', 'either', 'pipeNext', 'pipePair'].includes(spec.route)) {
+        if (!/^[1-9]\d*$/.test(yes) && !(yes === 'END' && ['GO', 'CHANGE'].includes(cmd)))
+          throw new Error('Wybierz krok po wykonaniu działania.');
+        if ((spec.route === 'pair' || spec.route === 'pipePair' || no) && !/^[1-9]\d*$/.test(no))
+          throw new Error('Wybierz krok dla niespełnionego warunku.');
+      }
+      let body;
+      if (cmd === 'DIG')
+        body =
+          values.hardness +
+          ' ' +
+          values.item +
+          ';' +
+          values.amount +
+          ' ' +
+          values.charges +
+          ' ' +
+          values.minutes +
+          (values.water ? ' WATER' : '') +
+          (values.xp ? ' XP=' + values.xp : '');
+      else if (cmd === 'GONPC') body = values.npc + ' ->' + values.step;
+      else if (spec.route.startsWith('pipe'))
+        body =
+          spec.fields.map((field) => values[field.key] || '').join('|') +
+          '|->' +
+          yes +
+          (no ? '|->' + no : '');
+      else
+        body =
+          spec.fields
+            .map((field) => values[field.key] || '')
+            .filter(Boolean)
+            .join(' ') + (yes ? (no ? ' THEN ->' + yes + ' ELSE ->' + no : ' ->' + yes) : '');
+      return '#' + cmd + (body ? ' ' + body.trimStart() : '');
+    }
+
+    function changed(node) {
+      node.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    function valueField(label, value = '', onlyProgress = false) {
+      const choices = onlyProgress
+        ? [
+            ['PROGRESS', 'Progress gracza'],
+            ['GPROGRESS', 'Progress globalny']
+          ]
+        : [
+            ['number', 'Liczba'],
+            ['PROGRESS', 'Progress gracza'],
+            ['GPROGRESS', 'Progress globalny'],
+            ['PROGRESS_LAST_UPDATE', 'Sekundy od zapisu gracza'],
+            ['GPROGRESS_LAST_UPDATE', 'Sekundy od zapisu globalnego'],
+            ['LVL', 'Poziom postaci'],
+            ['AID', 'Numer konta'],
+            ['CURRENCY', 'Pierwsza waluta'],
+            ['CURRENCY2', 'Druga waluta'],
+            ['ITEM', 'Sztuki przedmiotu w torbie'],
+            ['ITEM_SPACE', 'Wolne miejsca w torbie'],
+            ['RAND', 'Losowa liczba'],
+            ['DATE', 'Data i czas'],
+            ['macro', 'Skrót świata']
+          ];
+      const parsed = value.match(/^(G?PROGRESS(?:_LAST_UPDATE)?|ITEM|RAND|DATE):(.*)$/);
+      const type =
+        parsed?.[1] ||
+        (/^\$/.test(value)
+          ? 'macro'
+          : choices.some(([key]) => key === value)
+            ? value
+            : onlyProgress
+              ? 'PROGRESS'
+              : 'number');
+      const kind = select(choices, type);
+      const first = input(
+        (type === 'DATE' ? parsed?.[2] : parsed?.[2]?.split(':')[0]) ||
+          (type === 'macro' ? value.slice(1, -1) : type === 'number' ? value : '')
+      );
+      const last = input(parsed?.[2]?.split(':')[1] || '');
+      const date = select(
+        [
+          ['H', 'Godzina 0–23'],
+          ['i', 'Minuta'],
+          ['N', 'Dzień tygodnia 1–7'],
+          ['d', 'Dzień miesiąca'],
+          ['m', 'Miesiąc'],
+          ['Y', 'Rok'],
+          ['Ymd', 'Pełna data: rok, miesiąc, dzień'],
+          ['md', 'Miesiąc i dzień'],
+          ['z', 'Dzień roku'],
+          ['other', 'Inny format PHP']
+        ],
+        type === 'DATE' ? parsed[2] : 'Ymd'
+      );
+      if (type === 'DATE' && date.value !== parsed[2]) date.value = 'other';
+      const firstBox = field('Liczba lub numer', first);
+      const lastBox = field('Do', last);
+      const dateBox = field('Format daty', date);
+      const choose = button('Wybierz z listy', () =>
+        app.pick(
+          kind.value === 'ITEM' ? 'item' : 'progress',
+          (record) => {
+            first.value = record.id;
+            changed(first);
+          },
+          { scope: kind.value.startsWith('G') ? 'global' : 'player', value: first.value }
+        )
+      );
+      const box = el(
+        'div',
+        { class: 'dp-arg dp-stack' },
+        field(label, kind),
+        el('div', { class: 'dp-row' }, firstBox, lastBox, choose),
+        dateBox
+      );
+      function update() {
+        const hasID = /PROGRESS|ITEM$/.test(kind.value);
+        firstBox.hidden =
+          !hasID &&
+          !['number', 'RAND', 'macro'].includes(kind.value) &&
+          !(kind.value === 'DATE' && date.value === 'other');
+        firstBox.querySelector('.dp-label').textContent = hasID
+          ? 'Numer'
+          : kind.value === 'RAND'
+            ? 'Od'
+            : kind.value === 'macro'
+              ? 'Nazwa skrótu'
+              : kind.value === 'DATE'
+                ? 'Format PHP'
+                : 'Liczba';
+        lastBox.hidden = kind.value !== 'RAND';
+        dateBox.hidden = kind.value !== 'DATE';
+        choose.hidden = !hasID;
+      }
+      kind.addEventListener('change', update);
+      date.addEventListener('change', update);
+      update();
+      return {
+        box,
+        value: () =>
+          kind.value === 'number'
+            ? first.value.trim()
+            : kind.value === 'macro'
+              ? '$' + first.value.trim() + '$'
+              : kind.value === 'DATE'
+                ? 'DATE:' + (date.value === 'other' ? first.value.trim() : date.value)
+                : kind.value === 'RAND'
+                  ? 'RAND:' + first.value.trim() + ':' + last.value.trim()
+                  : /PROGRESS|ITEM$/.test(kind.value)
+                    ? kind.value + ':' + first.value.trim()
+                    : kind.value
+      };
+    }
+
+    function arg(fieldSpec, initial = '') {
+      const type = fieldSpec.type;
+      if (type === 'operand' || type === 'destination')
+        return valueField(fieldSpec.label, initial, type === 'destination');
+      if (type === 'enum') {
+        const options = [...fieldSpec.values];
+        if (initial && !options.some(([key]) => key === initial))
+          options.push([initial, initial + ' (z istniejącej linii)']);
+        const control = select(options, initial || options[0]?.[0]);
+        return { box: field(fieldSpec.label, control), value: () => control.value };
+      }
+      if (type === 'paid' || type === 'water') {
+        const control = el('input', { type: 'checkbox', checked: !!initial });
+        return {
+          box: field(fieldSpec.label, control),
+          value: () => (control.checked ? type.toUpperCase() : '')
+        };
+      }
+      if (['tiles', 'targets', 'entities', 'names'].includes(type)) {
+        const rows = [];
+        const list = el('div', { class: 'dp-arg-list dp-stack' });
+        const box = el('section', { class: 'dp-stack' }, el('strong', { text: fieldSpec.label }), list);
+        const refresh = () => {
+          list.replaceChildren(...rows.map((row) => row.box));
+          changed(box);
+        };
+        const addRow = (value = '') => {
+          const a = input(type === 'tiles' ? value.split(',')[0] || '' : value);
+          const b = type === 'tiles' ? input(value.split(',')[1] || '') : null;
+          const row = { a, b };
+          const pick = button('Wybierz', () =>
+            app.pick(
+              fieldSpec.kind || 'item',
+              (record) => {
+                a.value = record.id;
+                changed(a);
+              },
+              { value: a.value }
+            )
+          );
+          const remove = button(
+            'Usuń',
+            () => {
+              rows.splice(rows.indexOf(row), 1);
+              refresh();
+            },
+            'dp-small'
+          );
+          row.box = el(
+            'div',
+            { class: 'dp-row' },
+            field(
+              type === 'tiles'
+                ? 'x'
+                : type === 'targets'
+                  ? 'Numer kroku'
+                  : type === 'names'
+                    ? 'Nazwa fazy'
+                    : 'Numer szablonu lub konta',
+              a
+            ),
+            b ? field('y', b) : null,
+            type === 'entities' ? pick : null,
+            remove
+          );
+          if (type === 'targets') {
+            const choose = select([
+              ['', 'Wybierz krok…'],
+              ...(arg.source ? roots(arg.source).map((row) => [row.key, caption(row)]) : [])
+            ]);
+            choose.addEventListener('change', () => {
+              if (choose.value) {
+                a.value = choose.value;
+                changed(a);
+              }
+            });
+            row.box.insertBefore(field('Istniejący krok', choose), remove);
+          }
+          rows.push(row);
+          refresh();
+        };
+        if (initial) initial.split(type === 'tiles' || type === 'targets' ? /\s+/ : ',').forEach(addRow);
+        box.append(button(type === 'tiles' ? 'Dodaj kratkę' : 'Dodaj pozycję', () => addRow()));
+        if (fieldSpec.zero) box.append(button('Dodaj nowe wolne miejsce', () => addRow('0')));
+        if (!rows.length && !fieldSpec.optional) addRow();
+        return {
+          box,
+          value: () =>
+            rows
+              .map((row) => row.a.value.trim() + (row.b ? ',' + row.b.value.trim() : ''))
+              .join(type === 'tiles' || type === 'targets' ? ' ' : ',')
+        };
+      }
+      if (type === 'entity') {
+        const control = picker(
+          fieldSpec.kind,
+          fieldSpec.label,
+          () => control.box.dispatchEvent(new Event('change', { bubbles: true })),
+          () => fieldSpec.scope || 'player'
+        );
+        control.id.value = initial;
+        if (fieldSpec.optional)
+          control.box.append(el('span', { class: 'dp-help', text: 'Puste pole pomija ten parametr.' }));
+        return { box: control.box, value: () => control.id.value.trim(), input: control.id };
+      }
+      if (['range', 'state', 'amount', 'integer', 'number', 'skill'].includes(type)) {
+        const modes =
+          type === 'range'
+            ? [
+                ['exact', 'Dokładnie'],
+                ['min', 'Co najmniej'],
+                ['max', 'Najwyżej'],
+                ['between', 'W przedziale']
+              ]
+            : type === 'state'
+              ? [
+                  ['exact', 'Ustaw liczbę'],
+                  ['++', 'Zwiększ o 1'],
+                  ['--', 'Zmniejsz o 1']
+                ]
+              : type === 'amount'
+                ? [
+                    ['exact', 'Stała liczba'],
+                    ['between', 'Losowa liczba od–do']
+                  ]
+                : type === 'skill'
+                  ? [
+                      ['free', 'Wolne miejsce'],
+                      ['any', 'Dowolny obecny wybór'],
+                      ['exact', 'Numer umiejętności']
+                    ]
+                  : [['exact', 'Wpisana liczba']];
+        if (!fieldSpec.reply)
+          modes.push(
+            ['player', 'Wartość progressu gracza'],
+            ['global', 'Wartość progressu świata'],
+            ['random', 'Losowa liczba']
+          );
+        modes.push(['macro', 'Skrót świata']);
+        let mode = 'exact';
+        let first = initial;
+        let second = '';
+        if (['++', '--', 'free', 'any'].includes(initial)) {
+          mode = initial;
+          first = '';
+        } else if (/^\$[^$]+\$$/.test(initial)) {
+          mode = 'macro';
+          first = initial.slice(1, -1);
+        } else if (/^\[(?:PVAL|PGVAL|PROGRESS|GPROGRESS):/.test(initial)) {
+          const m = initial.match(/^\[(PVAL|PGVAL|PROGRESS|GPROGRESS):(-?\d+)(?:\+(\d+))?\]$/);
+          if (m) {
+            mode = m[1].startsWith('PG') || m[1].startsWith('G') ? 'global' : 'player';
+            first = m[2];
+            second = m[3] || '';
+          }
+        } else if (/^\[RAND:/.test(initial)) {
+          const m = initial.match(/^\[RAND:(\d+):(\d+)\]$/);
+          if (m) {
+            mode = 'random';
+            first = m[1];
+            second = m[2];
+          }
+        } else if (type === 'range' && initial.includes('..')) {
+          [first, second] = initial.split('..');
+          mode = first && second ? 'between' : first ? 'min' : 'max';
+          if (!first) first = second;
+        } else if (type === 'amount' && /^\d+-\d+$/.test(initial)) {
+          [first, second] = initial.split('-');
+          mode = 'between';
+        }
+        const choice = select(modes, mode);
+        const a = input(first);
+        const b = input(second);
+        const aBox = field('Wartość', a);
+        const bBox = field('Druga wartość', b);
+        const choose = button('Wybierz progress', () =>
+          app.pick(
+            'progress',
+            (record) => {
+              a.value = record.id;
+              changed(a);
+            },
+            { scope: choice.value === 'global' ? 'global' : 'player', value: a.value }
+          )
+        );
+        const box = el(
+          'div',
+          { class: 'dp-arg dp-stack' },
+          field(fieldSpec.label, choice),
+          el('div', { class: 'dp-row' }, aBox, bBox, choose)
+        );
+        function update() {
+          aBox.hidden = ['++', '--', 'free', 'any'].includes(choice.value);
+          bBox.hidden = !['between', 'random', 'player', 'global'].includes(choice.value);
+          choose.hidden = !['player', 'global'].includes(choice.value);
+          aBox.querySelector('.dp-label').textContent = ['player', 'global'].includes(choice.value)
+            ? 'Numer progressu'
+            : choice.value === 'macro'
+              ? 'Nazwa skrótu'
+              : ['between', 'random'].includes(choice.value)
+                ? 'Od'
+                : 'Wartość';
+          bBox.querySelector('.dp-label').textContent = ['player', 'global'].includes(choice.value)
+            ? 'Dodaj tylko do odczytu (opcjonalnie)'
+            : 'Do';
+        }
+        choice.addEventListener('change', update);
+        update();
+        return {
+          box,
+          value: () =>
+            ['++', '--', 'free', 'any'].includes(choice.value)
+              ? choice.value
+              : choice.value === 'macro'
+                ? '$' + a.value.trim() + '$'
+                : choice.value === 'random'
+                  ? '[RAND:' + a.value.trim() + ':' + b.value.trim() + ']'
+                  : ['player', 'global'].includes(choice.value)
+                    ? '[' +
+                      (choice.value === 'global' ? 'PGVAL' : 'PVAL') +
+                      ':' +
+                      a.value.trim() +
+                      (b.value.trim() ? '+' + b.value.trim() : '') +
+                      ']'
+                    : choice.value === 'min'
+                      ? a.value.trim() + '..'
+                      : choice.value === 'max'
+                        ? '..' + a.value.trim()
+                        : choice.value === 'between'
+                          ? a.value.trim() + (type === 'amount' ? '-' : '..') + b.value.trim()
+                          : a.value.trim()
+        };
+      }
+      const control = fieldSpec.rest ? area(initial, 3) : input(initial);
+      return {
+        box: field(fieldSpec.label, control, fieldSpec.optional ? 'Opcjonalne.' : ''),
+        value: () => control.value.trim()
+      };
+    }
+
+    function moveStep(source, row, newID) {
+      let result = source;
+      const moved = talk(source).filter(
+        (part) => part.key === row.key || (part.reply && part.parent === row.key)
+      );
+      for (const part of moved.reverse()) result = replace(result, part, part.raw.replace(/^\d+/, newID));
+      return result;
+    }
+
+    function commandText(source, row, model) {
+      const spec = catalog.get(model.cmd);
+      if (!spec) throw new Error('Wybierz działanie.');
+      const draft = plan(source);
+      const edit = model.edit;
+      if (row) unique(talk(source), row.key);
+      if (edit && source.slice(edit.start, edit.end) !== edit.raw)
+        throw new Error('Polecenie zmieniło się. Otwórz je ponownie.');
+      if (edit && model.unchanged) return { text: source, code: row.raw };
+      let first = row?.key;
+      let continuation = model.next || 'END';
+      if (!edit && row?.reply) first = draft.take();
+      if (!edit && model.place === 'before') {
+        continuation = draft.take();
+        draft.source = moveStep(source, row, continuation);
+        first = row.key;
+      }
+      if (!row) first = draft.take();
+      const dest = (value) => {
+        if (value?.id === '@continue') {
+          if (continuation === 'END' || continuation === '0')
+            return ['GO', 'CHANGE'].includes(model.cmd) ? 'END' : destination(draft, { id: '@end' });
+          return continuation;
+        }
+        if ((value?.id === '@end' || value?.id === 'END') && ['GO', 'CHANGE'].includes(model.cmd))
+          return 'END';
+        return destination(draft, value);
+      };
+      const yes = ['pair', 'next', 'either', 'pipeNext', 'pipePair'].includes(spec.route)
+        ? dest(model.yes)
+        : '';
+      const no =
+        ['pair', 'pipePair'].includes(spec.route) || (spec.route === 'either' && model.branch)
+          ? dest(model.no)
+          : '';
+      let command = encode(model.cmd, model.values, yes, no);
+      if (!spec.route && !edit && (!row || row.reply || model.place === 'before')) {
+        const target = model.yes || { id: '@continue' };
+        const next =
+          ['@end', 'END', '0'].includes(target.id) ||
+          (target.id === '@continue' && ['END', '0'].includes(continuation))
+            ? 'END'
+            : dest(target);
+        command += ' #GO ->' + next;
+      }
+      if (edit) {
+        draft.source = source.slice(0, edit.start) + command + source.slice(edit.end);
+      } else if (row?.reply) {
+        const nextBody = /->(?:END|\d+)\s*$/.test(row.body)
+          ? row.body.replace(/->(?:END|\d+)\s*$/, '->' + first)
+          : row.body + ' ->' + first;
+        draft.source = replace(source, row, row.prefix + nextBody);
+        draft.added.unshift(first + '. ' + command);
+      } else if (model.place === 'before') {
+        draft.added.unshift(first + '. ' + command);
+      } else if (row) {
+        const commands = chunks(row.body);
+        if (commands.filter((part) => part.cmd === model.cmd).length >= (model.cmd === 'EMO' ? 5 : 1))
+          throw new Error('To działanie już występuje w kroku. Dodaj je przed krokiem jako osobny krok.');
+        const existingJump = commands.find(
+          (part) => jumps.has(part.cmd) || catalog.get(part.cmd)?.route === 'close'
+        );
+        if (spec.route && existingJump)
+          throw new Error(
+            'Ten krok już wybiera dalszą drogę albo zamyka rozmowę. Dodaj działanie przed krokiem.'
+          );
+        draft.source = replace(source, row, row.raw + ' ' + command);
+      } else draft.added.unshift(first + '. ' + command);
+      return {
+        text: draft.finish(),
+        code: (edit || (row && model.place === 'inside')
+          ? [draft.source.slice(row.start).split(/\r\n|\n|\r/)[0]]
+          : draft.added
+        ).join('\n')
+      };
+    }
+
+    function command(control, row = null, done = () => {}, editing = null) {
+      const source = control.value;
+      const initial = editing ? decode(editing.raw) : null;
+      if (editing && !initial?.valid)
+        return note(
+          'Ten zapis zawiera nierozpoznane parametry. Zachowano źródło; użyj edycji tej linii.',
+          'error'
+        );
+      const box = modal(
+        editing ? 'Edytuj działanie' : row?.reply ? 'Działanie po odpowiedzi' : 'Dodaj działanie lub warunek'
+      );
+      help(box);
+      const groups = [...new Set([...catalog.values()].map((spec) => spec.group))];
+      const group = select(
+        groups.map((value) => [value, value]),
+        catalog.get(initial?.cmd)?.group || 'Progressy'
+      );
+      const choice = select([], '');
+      const explanation = el('p', { class: 'dp-help' });
+      const module = el('p', { class: 'dp-help' });
+      const fields = el('div', { class: 'dp-command-fields dp-stack' });
+      const stagesBox = el('div', { class: 'dp-stack' });
+      let stageVersion = 0;
+      const place = select(
+        [
+          ['inside', 'W tym kroku'],
+          ['before', 'Przed tym krokiem, z osobnym przejściem']
+        ],
+        'inside'
+      );
+      const placeBox = field(
+        'Miejsce działania',
+        place,
+        'Działanie przed krokiem dostaje jego numer; dotychczasowa wypowiedź i jej odpowiedzi przenoszą się razem pod wolny numer.'
+      );
+      const branch = el('input', { type: 'checkbox', checked: !!initial?.no || !initial });
+      const branchBox = field('Oddzielna droga przy braku miejsca', branch);
+      const next = row?.reply ? row.body.match(/->(END|\d+)\s*$/)?.[1] || 'END' : 'END';
+      const yes = target(
+        source,
+        'Gdy spełniony / po wykonaniu',
+        initial?.yes || (row ? '@continue' : '@end')
+      );
+      const no = target(source, 'Gdy niespełniony', initial?.no || '@end');
+      for (const pick of [yes, no]) {
+        if (row && !editing)
+          pick.choice.prepend(
+            el('option', {
+              value: '@continue',
+              text: row.reply ? 'Dotychczasowy cel odpowiedzi' : 'Dotychczasowa wypowiedź i odpowiedzi'
+            })
+          );
+        if (row && !editing && pick === yes) pick.choice.value = '@continue';
+      }
+      let controls = new Map();
+      let before = '';
+      box.body.append(
+        field('Grupa działań', group),
+        field('Działanie', choice),
+        explanation,
+        module,
+        fields,
+        stagesBox,
+        placeBox,
+        branchBox,
+        yes.box,
+        no.box
+      );
+      function values() {
+        return Object.fromEntries([...controls].map(([key, value]) => [key, value.value()]));
+      }
+      function layout() {
+        const spec = catalog.get(choice.value);
+        placeBox.hidden = !row || row.reply || !!editing;
+        yes.box.hidden =
+          !['pair', 'next', 'either', 'pipeNext', 'pipePair'].includes(spec.route) &&
+          !(!spec.route && !editing && (!row || row.reply || place.value === 'before'));
+        branchBox.hidden = spec.route !== 'either';
+        no.box.hidden =
+          !['pair', 'pipePair'].includes(spec.route) && !(spec.route === 'either' && branch.checked);
+        const continuation = row?.reply || place.value === 'before';
+        for (const target of [yes, no]) {
+          const option = [...target.choice.options].find((option) => option.value === '@continue');
+          if (option) option.disabled = !continuation;
+          if (!continuation && target.choice.value === '@continue') target.choice.value = '@end';
+        }
+      }
+      async function loadStages() {
+        const serial = ++stageVersion;
+        stagesBox.replaceChildren();
+        const spec = catalog.get(choice.value);
+        const progress = spec.fields.find((field) => field.kind === 'progress' && field.scope === 'player');
+        const value = spec.fields.find(
+          (field) => field.key === 'value' && ['state', 'range'].includes(field.type)
+        );
+        if (!progress || !value) return;
+        const number = controls.get(progress.key).value();
+        if (!int(number)) return;
+        try {
+          const quests = await app.list('quest');
+          if (
+            serial !== stageVersion ||
+            !box.box.isConnected ||
+            !quests.some((quest) => String(quest.id) === number)
+          )
+            return;
+          const rows = await app.stages(number);
+          if (serial !== stageVersion || !box.box.isConnected) return;
+          const stage = select([
+            ['', 'Wybierz etap…'],
+            ...rows.map((row) => [row.value, row.value + ' · ' + row.label])
+          ]);
+          if (value.type === 'state')
+            [...stage.options].forEach((option) => {
+              option.disabled = option.value && !int(option.value);
+            });
+          stage.addEventListener('change', () => {
+            if (!stage.value) return;
+            const previous = controls.get(value.key);
+            const next = arg(value, stage.value);
+            previous.box.replaceWith(next.box);
+            controls.set(value.key, next);
+            changed(stage);
+          });
+          stagesBox.append(
+            field(
+              'Etap potwierdzonego questa',
+              stage,
+              value.type === 'state'
+                ? 'Zakres opisu nie jest konkretną wartością do zapisania.'
+                : 'Wybrany etap uzupełnia warunek wartością lub zakresem.'
+            )
+          );
+        } catch {}
+      }
+      function choose() {
+        const spec = catalog.get(choice.value);
+        fields.replaceChildren();
+        controls = new Map();
+        arg.source = source;
+        for (const field of spec.fields) {
+          const value = arg(field, initial?.cmd === spec.cmd ? initial.values[field.key] : '');
+          controls.set(field.key, value);
+          fields.append(value.box);
+        }
+        explanation.textContent = spec.help;
+        module.textContent = 'Wymagany moduł: ' + spec.module + '.';
+        if (!editing && row && !row.reply)
+          place.value = spec.route && spec.route !== 'close' ? 'before' : 'inside';
+        layout();
+        before = JSON.stringify({
+          values: values(),
+          yes: yes.value(),
+          no: no.value(),
+          branch: branch.checked
+        });
+        const progress = spec.fields.find((field) => field.kind === 'progress' && field.scope === 'player');
+        if (progress) controls.get(progress.key).box.addEventListener('change', loadStages);
+        loadStages();
+        changed(choice);
+      }
+      function regroup() {
+        choice.replaceChildren(
+          ...[...catalog.values()]
+            .filter((spec) => spec.group === group.value)
+            .map((spec) => el('option', { value: spec.cmd, text: spec.label + ' · #' + spec.cmd }))
+        );
+        if (initial && catalog.get(initial.cmd).group === group.value) choice.value = initial.cmd;
+        choose();
+      }
+      group.addEventListener('change', regroup);
+      choice.addEventListener('change', choose);
+      place.addEventListener('change', layout);
+      branch.addEventListener('change', layout);
+      regroup();
+      review(
+        box,
+        () =>
+          commandText(source, row, {
+            cmd: choice.value,
+            values: values(),
+            place: place.value,
+            yes: yes.value(),
+            no: no.value(),
+            next,
+            branch: branch.checked,
+            edit: editing,
+            unchanged:
+              editing &&
+              initial.cmd === choice.value &&
+              before ===
+                JSON.stringify({ values: values(), yes: yes.value(), no: no.value(), branch: branch.checked })
+          }),
+        (result) => apply(control, source, result.text, done)
+      );
+    }
+
+    function replyParts(body) {
+      const conditions = {};
+      let rest = body;
+      for (const cmd of order) {
+        const match = rest.match(
+          cmd.includes('PROGRESS')
+            ? new RegExp('^#' + cmd + '\\s+(\\S+)\\s+(\\S+)\\s+')
+            : new RegExp('^#' + cmd + '\\s+(\\S+)\\s+')
+        );
+        if (match) {
+          conditions[cmd] = [match[1], match[2]];
+          rest = rest.slice(match[0].length);
+        }
+      }
+      const route = rest.match(/\s*->(END|\d+)\s*$/);
+      if (route) rest = rest.slice(0, route.index);
+      let icon = '';
+      for (const name of ['BATTLE', 'GAME', 'HEAL', 'SHOP', 'CQUEST', 'QUEST', 'LINE', 'EXIT'])
+        if (new RegExp('(^| )#' + name + '\\b').test(rest)) {
+          icon = name;
+          rest = rest.replace(new RegExp('(^| )#' + name + '\\b', 'g'), ' ');
+        }
+      return {
+        words: rest.trim(),
+        icon,
+        next: route?.[1] || 'END',
+        conditions,
+        safe: !/(^| )#[A-Z]|->/.test(rest)
+      };
+    }
+
+    function tokens(box, control, reply) {
+      const insert = (text) => {
+        const first = control.selectionStart ?? control.value.length;
+        const last = control.selectionEnd ?? first;
+        control.value = control.value.slice(0, first) + text + control.value.slice(last);
+        control.focus();
+        control.setSelectionRange(first + text.length, first + text.length);
+        changed(control);
+      };
+      const buttons = el(
+        'div',
+        { class: 'dp-row' },
+        button('Imię gracza', () => insert('[NICK]')),
+        button('Nowy wiersz', () => insert('<br>')),
+        button('Pogrubienie', () => {
+          const text = control.value.slice(control.selectionStart, control.selectionEnd) || 'tekst';
+          insert('<b>' + text + '</b>');
+        })
+      );
+      if (!reply)
+        buttons.append(
+          button('Wartość progressu', () => {
+            const dialog = modal('Wartość w wypowiedzi');
+            const scope = select(
+              [
+                ['player', 'Gracza'],
+                ['global', 'Globalny']
+              ],
+              'player'
+            );
+            const pick = picker(
+              'progress',
+              'Progress',
+              () => {},
+              () => scope.value
+            );
+            const extra = input('');
+            dialog.body.append(
+              field('Zakres', scope),
+              pick.box,
+              field('Dodaj do wyświetlanej liczby', extra, 'Opcjonalnie. Nie zmienia zapisanej wartości.')
+            );
+            dialog.foot.append(
+              button('Anuluj', dialog.close),
+              button(
+                'Wstaw do tekstu',
+                () => {
+                  if (!int(pick.id.value) || (extra.value && !natural(extra.value)))
+                    return note('Wybierz progress i nieujemną liczbę dodawaną.', 'error');
+                  insert(
+                    '[' +
+                      (scope.value === 'global' ? 'PGVAL' : 'PVAL') +
+                      ':' +
+                      pick.id.value +
+                      (extra.value ? '+' + extra.value : '') +
+                      ']'
+                  );
+                  dialog.close();
+                },
+                'dp-primary'
+              )
+            );
+          })
+        );
+      box.append(buttons);
+    }
+
+    function replyEditor(control, row = null, parentKey = '', done = () => {}) {
+      const source = control.value;
+      const data = row
+        ? replyParts(row.body)
+        : { words: '', icon: '', next: 'END', conditions: {}, safe: true };
+      if (!data.safe) return editLine(control, row, false, done, true);
+      const box = modal(row ? 'Odpowiedź ' + row.key : 'Nowa odpowiedź gracza');
+      help(box);
+      const parent = select(
+        roots(source).map((step) => [step.key, step.key + ' · ' + short(step.body)]),
+        row?.parent || parentKey
+      );
+      parent.disabled = !!row;
+      const words = area(data.words, 3);
+      const icon = select(icons, data.icon);
+      const next = target(source, 'Po kliknięciu', data.next);
+      box.body.append(
+        field('Odpowiedź pod wypowiedzią', parent),
+        field('Treść odpowiedzi', words),
+        field('Ikona', icon),
+        next.box
+      );
+      tokens(box.body, words, true);
+      const conditions = [];
+      const holder = el('section', { class: 'dp-stack' }, el('h3', { text: 'Kiedy pokazać odpowiedź' }));
+      for (const cmd of order) {
+        const isProgress = cmd.includes('PROGRESS');
+        const enabled = el('input', { type: 'checkbox', checked: !!data.conditions[cmd] });
+        const first = arg(
+          {
+            ...(isProgress
+              ? pg(cmd === 'IFGPROGRESS')
+              : cmd === 'IFITEM'
+                ? id('id', 'Posiadany przedmiot')
+                : n('level', 'Minimalny poziom obozu')),
+            reply: true
+          },
+          data.conditions[cmd]?.[0] || ''
+        );
+        const second = isProgress
+          ? arg(f('value', 'Wymagana wartość', 'range', { reply: true }), data.conditions[cmd]?.[1] || '')
+          : null;
+        const fields = el('div', { class: 'dp-grid' }, first.box, second?.box || null);
+        fields.hidden = !enabled.checked;
+        enabled.addEventListener('change', () => {
+          fields.hidden = !enabled.checked;
+        });
+        holder.append(
+          el(
+            'div',
+            { class: 'dp-card' },
+            field(
+              {
+                IFPROGRESS: 'Progress gracza',
+                IFGPROGRESS: 'Progress świata',
+                IFITEM: 'Przedmiot w torbie',
+                IFCAMP: 'Poziom obozu'
+              }[cmd],
+              enabled
+            ),
+            fields
+          )
+        );
+        conditions.push({ cmd, enabled, first, second });
+      }
+      box.body.append(
+        holder,
+        el('p', {
+          class: 'dp-help',
+          text: 'Panel zapisuje warunki na początku odpowiedzi w kolejności wymaganej przez grę. Czynności po kliknięciu dodaj przyciskiem przy odpowiedzi — trafią do osobnego kroku NPC.'
+        })
+      );
+      const snapshot = () =>
+        JSON.stringify({
+          parent: parent.value,
+          words: words.value,
+          icon: icon.value,
+          next: next.value(),
+          conditions: conditions.map((item) => [
+            item.cmd,
+            item.enabled.checked,
+            item.first.value(),
+            item.second?.value()
+          ])
+        });
+      const original = snapshot();
+      review(
+        box,
+        () => {
+          if (row && snapshot() === original) return { text: source, code: row.raw };
+          unique(roots(source), parent.value);
+          const draft = plan(source);
+          const destinationID = ['END', '@end', '0'].includes(next.value().id)
+            ? 'END'
+            : destination(draft, next.value());
+          const prefix = conditions
+            .filter((item) => item.enabled.checked)
+            .map((item) => {
+              const spec = item.cmd.includes('PROGRESS')
+                ? pg(item.cmd === 'IFGPROGRESS')
+                : item.cmd === 'IFITEM'
+                  ? id('id', 'Przedmiot')
+                  : n('level', 'Poziom obozu');
+              if (
+                !validArg({ ...spec, reply: true }, item.first.value()) ||
+                (item.second &&
+                  !validArg(f('value', 'Wartość', 'range', { reply: true }), item.second.value()))
+              )
+                throw new Error('Uzupełnij warunek: ' + spec.label + '.');
+              return (
+                '#' + item.cmd + ' ' + item.first.value() + (item.second ? ' ' + item.second.value() : '')
+              );
+            });
+          const body = [
+            ...prefix,
+            replyText(words.value),
+            icon.value ? '#' + icon.value : '',
+            '->' + destinationID
+          ]
+            .filter(Boolean)
+            .join(' ');
+          const line = (row?.prefix || replyKey(source, parent.value) + ' ') + body;
+          if (row) draft.source = replace(source, row, line);
+          else draft.added.push(line);
+          return {
+            text: draft.finish(),
+            code: [line, ...draft.added.filter((added) => added !== line)].join('\n')
+          };
+        },
+        (result) => apply(control, source, result.text, done)
+      );
+    }
 
     function lines(text) {
       const out = [];
@@ -1838,6 +3780,16 @@
       }
       if (out.kind === 'other' && jumps.has(part.cmd) && !['GONPC', 'RAND'].includes(part.cmd))
         out.targets = [...raw.matchAll(/->(END|\d+)(?![\w.])/g)].map((match) => match[1]);
+      const model = decode(raw);
+      if (model) {
+        out.model = model;
+        out.editable = model.valid;
+        if (model.valid && out.kind === 'other') out.kind = 'command';
+        if (!model.valid) {
+          out.confidence = 'partial';
+          out.note = 'Część parametrów wymaga sprawdzenia. Zachowano cały oryginalny zapis.';
+        }
+      }
       if (row.reply) {
         out.confidence = 'inactive';
         out.editable = false;
@@ -1999,6 +3951,50 @@
             raw: row.raw
           })
         );
+      for (const line of lines(text)) {
+        if (!line.raw.trim() || /^\s*(?:\/\/|0\.|DEV\.)/.test(line.raw)) continue;
+        const row = rows.find((row) => row.index === line.index);
+        const source = row
+          ? chunks(row.body)
+              .filter(
+                (part) =>
+                  !catalog.has(part.cmd) ||
+                  catalog
+                    .get(part.cmd)
+                    .fields.some(
+                      (field) => field.kind === 'progress' || ['operand', 'destination'].includes(field.type)
+                    )
+              )
+              .map((part) => part.text)
+              .join(' ')
+          : line.raw;
+        const found = [
+          ...source.matchAll(
+            /#(IFG?PROGRESS|G?PROGRESS|IFTIME|RESET_PROGRESS_LAST_DAY|RANKING)\s+(-?\d+)(?=\s|$)/g
+          )
+        ].map((match) => ({ scope: match[1].includes('GPROGRESS') ? 'global' : 'player', id: match[2] }));
+        found.push(...refs(source));
+        for (const ref of found) {
+          const key = ref.scope + ':' + ref.id;
+          if (uses.get(key)?.refs.some((item) => item.line === line.index + 1)) continue;
+          if (!uses.has(key)) uses.set(key, { ...ref, key, refs: [] });
+          uses
+            .get(key)
+            .refs.push({
+              key: row?.key || '',
+              line: line.index + 1,
+              kind: 'read',
+              confidence: 'partial',
+              raw: line.raw
+            });
+          gaps.push({
+            key: row?.key || '',
+            line: line.index + 1,
+            reason: 'Numer progressu znaleziono poza w pełni rozpoznanym zapisem. Sprawdź tę linię.',
+            raw: line.raw
+          });
+        }
+      }
       return {
         rows,
         uses: [...uses.values()].sort(
@@ -2028,6 +4024,18 @@
     }
 
     function describe(item, quests) {
+      if (item.kind === 'command' && item.model) {
+        const spec = catalog.get(item.cmd);
+        const values = spec.fields
+          .filter((field) => item.model.values[field.key])
+          .map((field) => field.label + ': ' + item.model.values[field.key]);
+        return (
+          spec.label +
+          (values.length ? ' — ' + values.join(' · ') : '') +
+          (item.model.yes ? ' → ' + item.model.yes + (item.model.no ? ' / ' + item.model.no : '') : '') +
+          (spec.route === 'close' ? ' · zamyka rozmowę' : '')
+        );
+      }
       const name = item.id ? progressName(item.id, item.scope, quests) : '';
       const dest = (id) =>
         id === 'END' ? 'koniec rozmowy' : id ? 'krok ' + id : 'cel do sprawdzenia w źródle';
@@ -2110,6 +4118,12 @@
             : 'składnia do sprawdzenia w źródle.') +
           (item.targets?.length ? ' Cele zapisane: ' + item.targets.map(dest).join(', ') + '.' : '');
       return (item.confidence === 'inactive' ? 'Nie wykonuje się tutaj: ' : '') + text;
+    }
+
+    function caption(row) {
+      const parsed = inspect(row);
+      const words = parsed.words || parsed.facts.map((item) => describe(item, new Map())).join(' · ');
+      return row.key + ' · ' + short(words || row.body);
     }
 
     function edges(text) {
@@ -2203,21 +4217,6 @@
       return value.id;
     }
 
-    function matchValue(mode, first, last) {
-      first = first.trim();
-      last = last.trim();
-      if (mode === 'range') {
-        const value = first + '..' + last;
-        if (!range(value))
-          throw new Error('Podaj prawidłowy zakres; dolna granica nie może przekraczać górnej.');
-        return value;
-      }
-      if (!int(first)) throw new Error('Wartość musi być liczbą całkowitą.');
-      if (mode === 'min') return first + '..';
-      if (mode === 'max') return '..' + first;
-      return first;
-    }
-
     function replyKey(text, parent) {
       const used = new Set(
         talk(text)
@@ -2234,108 +4233,6 @@
       if (/->|(^| )#[A-Z]/.test(text))
         throw new Error('Treść odpowiedzi wpisz bez poleceń i strzałek. Cel i ikonę wybierz w formularzu.');
       return textLine(text.trim());
-    }
-
-    function flow(text, data) {
-      if (!int(data.id)) throw new Error('Wybierz progress albo wpisz jego numer.');
-      const draft = plan(text);
-      const first = data.edit ? data.edit.key : draft.take();
-      const scope = data.scope === 'global' ? 'GPROGRESS' : 'PROGRESS';
-      let command;
-      if (data.op === 'condition') {
-        const value = matchValue(data.compare, data.value, data.last);
-        const yes = destination(draft, data.yes);
-        const no = destination(draft, data.no);
-        command =
-          '#IF' +
-          scope +
-          ' ' +
-          data.id +
-          ' ' +
-          value +
-          ' THEN ->' +
-          (data.compare === 'not' ? no : yes) +
-          ' ELSE ->' +
-          (data.compare === 'not' ? yes : no);
-      } else {
-        if (!int(data.value))
-          throw new Error('Wpisz konkretną liczbę całkowitą. Zakres etapu nie jest wartością do zapisania.');
-        const next = destination(draft, data.yes);
-        if (data.op === 'set') command = '#' + scope + ' ' + data.id + ' ' + data.value + ' ->' + next;
-        else {
-          if (!natural(data.value))
-            throw new Error(
-              'Podaj nieujemną liczbę. Dodawanie lub odejmowanie wybierz jako osobną czynność.'
-            );
-          command =
-            '#CHANGE ' +
-            scope +
-            ':' +
-            data.id +
-            ' ' +
-            (data.op === 'add' ? '+' : '-') +
-            ' ' +
-            data.value +
-            ' ->' +
-            next;
-        }
-      }
-      if (data.edit) {
-        unique(talk(text), data.edit.key);
-        if (text.slice(data.edit.start, data.edit.end) !== data.edit.raw)
-          throw new Error('Polecenie zmieniło się. Otwórz je ponownie.');
-        draft.source = text.slice(0, data.edit.start) + command + text.slice(data.edit.end);
-      } else draft.added.unshift(first + '. ' + command);
-      if (!data.edit && data.attach === 'reply') {
-        unique(roots(text), data.parent);
-        draft.added.push(replyKey(text, data.parent) + ' ' + replyText(data.answer) + ' ->' + first);
-      } else if (!data.edit && data.attach === 'edge') {
-        const edge = edges(text).find((item) => item.id === data.edge);
-        if (!edge) throw new Error('Wybierz przejście, w które wstawisz nowy krok.');
-        unique(talk(text), edge.key);
-        draft.source = text.slice(0, edge.start) + '->' + first + text.slice(edge.end);
-      } else if (!data.edit && data.attach === 'ending') {
-        const row = unique(talk(text), data.parent);
-        if (!row.reply || row.body.includes('->') || /\$[^$]+\$/.test(row.body))
-          throw new Error('To zakończenie odpowiedzi wymaga sprawdzenia w źródle. Wybierz jawne przejście.');
-        draft.source = replace(text, row, row.raw + ' ->' + first);
-      }
-      return {
-        text: draft.finish(),
-        code: (data.edit ? [first + '. ' + command, ...draft.added] : draft.added).join('\n'),
-        first
-      };
-    }
-
-    function visible(body, scope, id, value, overwrite) {
-      const wanted = scope === 'global' ? 'IFGPROGRESS' : 'IFPROGRESS';
-      const found = [];
-      let rest = body;
-      let previous = -1;
-      while (true) {
-        const m = rest.match(/^#(IFPROGRESS|IFGPROGRESS)\s+(-?\d+)\s+(\S+)\s+|^#(IFITEM|IFCAMP)\s+(\d+)\s+/);
-        if (!m) break;
-        const cmd = m[1] || m[4];
-        const position = order.indexOf(cmd);
-        if (position <= previous || (m[1] && !range(m[3])))
-          throw new Error(
-            'Istniejące warunki mają niejednoznaczną kolejność lub składnię. Zachowano źródło; popraw tę linię w kodzie.'
-          );
-        previous = position;
-        found.push({ cmd, raw: m[0].trimEnd() });
-        rest = rest.slice(m[0].length);
-      }
-      if (/(^| )#(?:IFPROGRESS|IFGPROGRESS|IFITEM|IFCAMP)\b/.test(rest))
-        throw new Error(
-          'Warunek widoczności znajduje się poza początkiem odpowiedzi albo ma nieznaną składnię. Zachowano źródło.'
-        );
-      const present = found.find((part) => part.cmd === wanted);
-      if (present && !overwrite)
-        throw new Error('Ta odpowiedź ma już taki warunek. Zaznacz zastąpienie istniejącego warunku.');
-      const next = found.filter((part) => part.cmd !== wanted);
-      next.push({ cmd: wanted, raw: '#' + wanted + ' ' + id + ' ' + value });
-      next.sort((a, b) => order.indexOf(a.cmd) - order.indexOf(b.cmd));
-      return next.map((part) => part.raw).join(' ') + ' ' + rest;
     }
 
     function apply(control, before, after, done = () => {}) {
@@ -2375,7 +4272,7 @@
           ['', 'Wybierz…'],
           ['@text', 'Nowa wypowiedź'],
           ['@end', 'Zakończ rozmowę'],
-          ...roots(text).map((row) => [row.key, row.key + ' · ' + short(row.body)])
+          ...roots(text).map((row) => [row.key, caption(row)])
         ],
         value === 'END' || value === '0' ? '@end' : value
       );
@@ -2457,414 +4354,8 @@
       return update;
     }
 
-    function progress(control, chosen = null, done = () => {}, edit = null) {
-      const source = control.value;
-      const caret = { start: control.selectionStart, end: control.selectionEnd };
-      const rows = talk(source);
-      const stepRows = roots(source);
-      const replies = rows.filter((row) => row.reply);
-      if (typeof chosen === 'string') chosen = rows.find((row) => row.key === chosen) || null;
-      if (chosen && source.slice(chosen.start, chosen.end) !== chosen.raw) {
-        note('Ta linia zmieniła się. Odśwież listę kroków.', 'error');
-        return;
-      }
-      const paths = edges(source).filter((path) => !chosen || path.key === chosen.key);
-      const box = modal(
-        edit
-          ? 'Zmień działanie · ' + chosen.key
-          : 'Dodaj progress · ' + (chosen ? (chosen.reply ? 'odpowiedź ' : 'krok ') + chosen.key : 'dialog')
-      );
-      help(box);
-      if (chosen)
-        box.body.append(
-          el('p', {
-            class: 'dp-card',
-            text: (chosen.reply ? 'Odpowiedź ' : 'Krok ') + chosen.key + ' · ' + short(chosen.body)
-          })
-        );
-      const options = [
-        ['condition', 'Sprawdź wartość i wybierz dalszy krok'],
-        ['set', 'Ustaw konkretną wartość'],
-        ['add', 'Dodaj do obecnej wartości'],
-        ['sub', 'Odejmij od obecnej wartości'],
-        ['visible', 'Pokaż odpowiedź tylko przy wybranej wartości'],
-        ['value', 'Pokaż wartość w wypowiedzi NPC']
-      ];
-      const op = select(
-        options.filter(
-          ([id]) =>
-            !edit ||
-            (edit.kind === 'visible' ? id === 'visible' : ['condition', 'set', 'add', 'sub'].includes(id))
-        ),
-        edit?.kind || (chosen?.reply ? 'visible' : 'condition')
-      );
-      const scope = select(
-        [
-          ['player', 'Gracza — osobna wartość dla każdego konta'],
-          ['global', 'Świata — wspólna wartość dla wszystkich']
-        ],
-        edit?.scope || 'player'
-      );
-      if (edit?.kind === 'visible') scope.disabled = true;
-      const purpose = el('p', { class: 'dp-help', role: 'status' });
-      const questNote = el('p', { class: 'dp-help', role: 'status' });
-      let questMap = new Map();
-      const questJob = app
-        .list('quest')
-        .then((result) => {
-          questMap = new Map(result.map((record) => [String(record.id), record]));
-        })
-        .catch(() => {});
-      let update = () => {};
-      let stageRequest = 0;
-      let hasStages = false;
-      const stages = select([['', 'Wpisz własną wartość']], '');
-      const stageField = field(
-        'Etap potwierdzonego questa',
-        stages,
-        'Ten quest czyta progress gracza o tym samym ID. Zakres etapu służy do warunku; zapis wymaga jednej liczby.'
-      );
-      const selected = picker(
-        'progress',
-        'ID progressu',
-        () => {
-          loadStages();
-          update();
-        },
-        () => scope.value,
-        (record) => progressName(String(record.id), scope.value, questMap)
-      );
-      selected.id.value = edit?.id || '';
-      const value = input(edit?.value || '0', { inputmode: 'numeric' });
-      const last = input('', { inputmode: 'numeric', placeholder: 'Pusta granica = bez ograniczenia' });
-      const compare = select(
-        [
-          ['equal', 'Równa'],
-          ['min', 'Co najmniej'],
-          ['max', 'Co najwyżej'],
-          ['range', 'W przedziale'],
-          ['not', 'Różna od']
-        ],
-        'equal'
-      );
-      const initialRange = edit?.value?.match(/^(-?\d+)?\.\.(-?\d+)?$/);
-      if (initialRange) {
-        compare.value = 'range';
-        value.value = initialRange[1] || '';
-        last.value = initialRange[2] || '';
-      }
-      const compareField = field('Porównanie', compare);
-      const valueField = field(
-        'Wartość',
-        value,
-        'To stan lub licznik zapisany pod wybranym ID, a nie numer kroku rozmowy.'
-      );
-      const lastField = field('Górna granica', last);
-      const values = el('div', { class: 'dp-grid' }, compareField, valueField, lastField);
-      const places = [];
-      if (!chosen?.reply && stepRows.length) places.push(['reply', 'Po kliknięciu nowej odpowiedzi gracza']);
-      if (paths.length) places.push(['edge', 'W wybranym przejściu z tej linii']);
-      if (chosen?.reply && !chosen.body.includes('->') && !/\$[^$]+\$/.test(chosen.body))
-        places.push(['ending', 'Po kliknięciu tej odpowiedzi, przed zakończeniem']);
-      places.push(['alone', 'Osobny krok — podłączę go później']);
-      const attach = select(places, paths.length === 1 ? 'edge' : places[0][0]);
-      const parent = select(
-        [['', 'Wybierz krok NPC…'], ...stepRows.map((row) => [row.key, row.key + ' · ' + short(row.body)])],
-        chosen?.reply ? chosen.parent : chosen?.key || ''
-      );
-      const answer = input('', { placeholder: 'Np. Odbieram nagrodę.' });
-      const replyBox = el(
-        'div',
-        { class: 'dp-grid' },
-        field('Krok z nową odpowiedzią', parent),
-        field('Treść odpowiedzi', answer)
-      );
-      const edge = select(
-        [['', 'Wybierz przejście…'], ...paths.map((path) => [path.id, path.label])],
-        paths.length === 1 ? paths[0].id : ''
-      );
-      const edgeField = field('Przejście, które ma prowadzić przez nowy krok', edge);
-      const alone = el('p', {
-        class: 'dp-help',
-        text: 'Nowy krok zostanie dopisany. Nie połączy się z istniejącymi krokami, dopóki nie ustawisz prowadzącego do niego przejścia.'
-      });
-      const ending = el('p', {
-        class: 'dp-help',
-        text: 'Ta odpowiedź dotąd kończyła rozmowę. Po kliknięciu wykona nową czynność, a następnie przejdzie do wskazanego niżej celu.'
-      });
-      const wiring = el(
-        'div',
-        { class: 'dp-stack' },
-        field('Miejsce operacji', attach),
-        replyBox,
-        edgeField,
-        alone,
-        ending
-      );
-      const yes = target(
-        source,
-        'Gdy spełniony / po wykonaniu',
-        edit?.yes || (attach.value === 'edge' ? paths[0]?.target : attach.value === 'ending' ? '@end' : '')
-      );
-      const no = target(source, 'Gdy niespełniony', edit?.no || '');
-      const routes = el('div', { class: 'dp-grid' }, yes.box, no.box);
-      const reply = select(
-        [
-          ['', 'Wybierz odpowiedź…'],
-          ...replies.map((row) => [String(row.index), row.key + ' · ' + short(row.body)])
-        ],
-        chosen?.reply ? String(chosen.index) : ''
-      );
-      const overwrite = el('input', { type: 'checkbox', checked: edit?.kind === 'visible' });
-      const visibility = el(
-        'div',
-        { class: 'dp-stack' },
-        field('Odpowiedź gracza', reply),
-        field('Zastąp istniejący warunek tego samego typu', overwrite),
-        el('p', {
-          class: 'dp-help',
-          text: 'Warunki są umieszczane na początku odpowiedzi w kolejności wymaganej przez silnik. Pozostała treść zostaje zachowana.'
-        })
-      );
-      const textStep = select(
-        [
-          ['', 'Wybierz wypowiedź…'],
-          ...stepRows.map((row) => [String(row.index), row.key + ' · ' + short(row.body)])
-        ],
-        !chosen?.reply && chosen ? String(chosen.index) : ''
-      );
-      const position = select(
-        [
-          ['end', 'Na końcu wypowiedzi, przed poleceniami'],
-          ['cursor', 'W zaznaczonym miejscu pola źródłowego']
-        ],
-        'end'
-      );
-      const valueSpot = el(
-        'div',
-        { class: 'dp-grid' },
-        field('Wypowiedź NPC', textStep),
-        field('Miejsce znacznika', position)
-      );
-      box.body.append(
-        field('Czynność', op),
-        purpose,
-        field('Zakres', scope),
-        selected.box,
-        questNote,
-        stageField,
-        values,
-        wiring,
-        routes,
-        visibility,
-        valueSpot
-      );
-
-      async function loadStages() {
-        const request = ++stageRequest;
-        const id = selected.id.value.trim();
-        hasStages = false;
-        stages.replaceChildren(el('option', { value: '', text: 'Wpisz własną wartość' }));
-        selected.name.textContent = int(id)
-          ? progressName(id, scope.value, questMap) + (Number(id) < 0 ? ' · numer systemowy' : '')
-          : 'Wybierz po nazwie albo wpisz ID progressu.';
-        questNote.textContent =
-          scope.value === 'global'
-            ? 'To wartość wspólna dla świata. Numer zgodny z questem gracza nie nadaje jej jego nazwy ani etapów.'
-            : int(id)
-              ? 'Sprawdzam, czy temu ID odpowiada dostępny quest…'
-              : 'ID wybiera zmienną. Wartość niżej określa jej stan; cele przejść wybierają numery kroków dialogu.';
-        layout();
-        if (!int(id) || scope.value !== 'player') return;
-        const current = () =>
-          request === stageRequest &&
-          box.box.isConnected &&
-          app.check(control) &&
-          scope.value === 'player' &&
-          selected.id.value.trim() === id;
-        try {
-          await questJob;
-          if (!current()) return;
-          selected.name.textContent = progressName(id, 'player', questMap);
-          if (!questMap.has(id)) {
-            questNote.textContent =
-              'Brak potwierdzonego questa o tym ID w dostępnych danych. Wpisz wartość zgodną z logiką dialogu; nie każdy progress jest questem.';
-            return;
-          }
-          questNote.textContent =
-            'Potwierdzony quest: ' +
-            questMap.get(id).name +
-            '. Jego etapy opisują wyłącznie progress gracza #' +
-            id +
-            '.';
-          const result = await app.stages(id);
-          if (!current()) return;
-          result.forEach((stage) =>
-            stages.append(
-              el('option', { value: stage.value, text: stage.value + ' · ' + short(stage.label) })
-            )
-          );
-          hasStages = result.length > 0;
-          if (!hasStages) questNote.textContent += ' Opisy etapów są niedostępne; wpisz wartość ręcznie.';
-          layout();
-        } catch {
-          if (current()) questNote.textContent = 'Nie udało się odczytać etapów. Wpisz wartość ręcznie.';
-        }
-      }
-
-      function layout() {
-        const logic = ['condition', 'set', 'add', 'sub'].includes(op.value);
-        const test = ['condition', 'visible'].includes(op.value);
-        values.hidden = op.value === 'value';
-        compareField.hidden = !test;
-        lastField.hidden = !test || compare.value !== 'range';
-        stageField.hidden =
-          !hasStages || scope.value !== 'player' || ['value', 'add', 'sub'].includes(op.value);
-        wiring.hidden = !logic || !!edit;
-        routes.hidden = !logic;
-        no.box.hidden = op.value !== 'condition';
-        replyBox.hidden = attach.value !== 'reply';
-        edgeField.hidden = attach.value !== 'edge';
-        alone.hidden = attach.value !== 'alone';
-        ending.hidden = attach.value !== 'ending';
-        visibility.hidden = op.value !== 'visible';
-        valueSpot.hidden = op.value !== 'value';
-        valueField.querySelector('.dp-label').textContent =
-          compare.value === 'range' && test
-            ? 'Dolna granica'
-            : ['add', 'sub'].includes(op.value)
-              ? 'O ile zmienić'
-              : 'Wartość';
-        purpose.textContent = {
-          condition:
-            'Warunek tylko odczytuje wartość. Rozmowa idzie do jednego z dwóch kroków; progress nie zmienia się.',
-          set: 'Ustawienie zastępuje dotychczasową wartość. Ustaw 2 oznacza zapisz 2 niezależnie od starej liczby. Zapis odświeża też datę zmiany.',
-          add: 'Dodawanie użyje #CHANGE. Dodaj 10 oznacza stara wartość + 10; samo #PROGRESS z +10 ustawiłoby stałą 10.',
-          sub: 'Odejmowanie użyje #CHANGE. Odejmij 10 oznacza stara wartość − 10; #PROGRESS z -10 ustawiłoby stałą -10.',
-          visible:
-            'Ten warunek tylko pokazuje lub ukrywa odpowiedź. Niczego nie zapisuje. Czynności po kliknięciu umieść w osobnym kroku.',
-          value:
-            'Znacznik pokaże wartość w wypowiedzi NPC. Nie zmienia progressu i nie działa w odpowiedziach gracza ani w #MESSAGE.'
-        }[op.value];
-        if (edit?.kind === 'visible')
-          purpose.textContent +=
-            ' Edytujesz warunek wybranego zakresu. Warunek drugiego zakresu dodaj osobno.';
-        if (logic)
-          purpose.textContent += edit
-            ? ' Zmieniasz wyłącznie wybrane polecenie tej linii.'
-            : ' Czynność powstanie w nowym kroku, połączonym w miejscu wybranym poniżej.';
-      }
-
-      stages.addEventListener('change', () => {
-        if (!stages.value) return;
-        const m = stages.value.match(/^(-?\d+)?\.\.(-?\d+)?$/);
-        if (m && ['condition', 'visible'].includes(op.value)) {
-          compare.value = 'range';
-          value.value = m[1] || '';
-          last.value = m[2] || '';
-        } else value.value = stages.value;
-        layout();
-        update();
-      });
-      scope.addEventListener('change', () => {
-        loadStages();
-        layout();
-        update();
-      });
-      [op, compare, attach].forEach((control) => control.addEventListener('change', layout));
-      edge.addEventListener('change', () => {
-        const path = paths.find((item) => item.id === edge.value);
-        if (path) yes.choice.value = ['END', '0'].includes(path.target) ? '@end' : path.target;
-        yes.refresh();
-      });
-      attach.addEventListener('change', () => {
-        if (attach.value === 'ending') {
-          yes.choice.value = '@end';
-          yes.refresh();
-        }
-      });
-      layout();
-      const state = () =>
-        JSON.stringify([
-          op.value,
-          scope.value,
-          selected.id.value.trim(),
-          compare.value,
-          value.value,
-          last.value,
-          yes.value(),
-          no.value(),
-          reply.value
-        ]);
-      const original = state();
-      update = review(
-        box,
-        () => {
-          const id = selected.id.value.trim();
-          if (!int(id)) throw new Error('Wybierz progress albo wpisz jego numer.');
-          if (edit && original === state()) return { text: source, code: edit.raw };
-          if (op.value === 'visible') {
-            if (compare.value === 'not')
-              throw new Error(
-                'Warunek widoczności obsługuje równość i zakres. Dla dwóch rozłącznych zakresów utwórz dwie odpowiedzi.'
-              );
-            const row = replies.find((item) => String(item.index) === reply.value);
-            if (!row) throw new Error('Wybierz odpowiedź gracza.');
-            unique(rows, row.key);
-            const body = visible(
-              row.body,
-              scope.value,
-              id,
-              matchValue(compare.value, value.value, last.value),
-              overwrite.checked
-            );
-            const raw = row.raw.slice(0, row.offset) + body;
-            return { text: replace(source, row, raw), code: raw };
-          }
-          if (op.value === 'value') {
-            const row = stepRows.find((item) => String(item.index) === textStep.value);
-            if (!row) throw new Error('Wybierz wypowiedź NPC.');
-            unique(rows, row.key);
-            const token = '[' + (scope.value === 'global' ? 'PGVAL' : 'PVAL') + ':' + id + ']';
-            const end = row.start + row.offset + (chunks(row.body)[0]?.start ?? row.body.length);
-            if (position.value === 'cursor') {
-              if (caret.start < row.start + row.offset || caret.end > end)
-                throw new Error(
-                  'Zaznacz miejsce w tekście tej wypowiedzi przed otwarciem kreatora. Znacznik nie działa w odpowiedzi ani w #MESSAGE.'
-                );
-              return { text: source.slice(0, caret.start) + token + source.slice(caret.end), code: token };
-            }
-            const content = source.slice(row.start + row.offset, end);
-            const trimmed = content.replace(/[ \t]+$/, '');
-            const tail = source.slice(end);
-            const fragment = trimmed + (trimmed ? ' ' : '') + token + (end < row.end ? ' ' : '');
-            return {
-              text: source.slice(0, row.start + row.offset) + fragment + tail,
-              code: row.key + '. ' + fragment
-            };
-          }
-          return flow(source, {
-            op: op.value,
-            scope: scope.value,
-            id,
-            value: value.value.trim(),
-            last: last.value.trim(),
-            compare: compare.value,
-            attach: attach.value,
-            parent: attach.value === 'ending' ? chosen.key : parent.value,
-            answer: answer.value,
-            edge: edge.value,
-            yes: yes.value(),
-            no: no.value(),
-            edit: edit ? { ...edit, key: chosen.key } : null
-          });
-        },
-        (result) => apply(control, source, result.text, done)
-      );
-      loadStages();
-    }
-
-    function editLine(control, row, quest = false, done = () => {}) {
+    function editLine(control, row, quest = false, done = () => {}, rawReply = false) {
+      if (row.reply && !quest && !rawReply) return replyEditor(control, row, '', done);
       const source = control.value;
       if (source.slice(row.start, row.end) !== row.raw) {
         note('Ta linia zmieniła się. Otwórz ją ponownie.', 'error');
@@ -2889,6 +4380,7 @@
           'Nowe wiersze zostaną zapisane jako <br>. Pozostałe linie dialogu zachowają oryginalną postać.'
         )
       );
+      if (!quest) tokens(box.body, words, false);
       if (code)
         box.body.append(
           el(
@@ -2946,6 +4438,7 @@
         }),
         field('Wypowiedź', words, 'Nowe wiersze zostaną zapisane jako <br>.')
       );
+      tokens(box.body, words, false);
       review(
         box,
         () => {
@@ -2958,41 +4451,7 @@
     }
 
     function newReply(control, parentKey = '', done = () => {}) {
-      const source = control.value;
-      const box = modal('Nowa odpowiedź gracza');
-      help(box);
-      const parent = select(
-        [['', 'Wybierz krok…'], ...roots(source).map((row) => [row.key, row.key + ' · ' + short(row.body)])],
-        parentKey
-      );
-      const words = input('');
-      const icon = select(icons, '');
-      const next = target(source, 'Po kliknięciu', '@end');
-      box.body.append(
-        field('Odpowiedź pod wypowiedzią', parent),
-        field('Treść odpowiedzi', words),
-        field('Ikona', icon),
-        next.box
-      );
-      review(
-        box,
-        () => {
-          unique(roots(source), parent.value);
-          const draft = plan(source);
-          const value = next.value();
-          const dest = value.id === '@end' ? 'END' : destination(draft, value);
-          const line =
-            replyKey(source, parent.value) +
-            ' ' +
-            replyText(words.value) +
-            (icon.value ? ' #' + icon.value : '') +
-            ' ->' +
-            dest;
-          draft.added.push(line);
-          return { text: draft.finish(), code: draft.added.join('\n') };
-        },
-        (result) => apply(control, source, result.text, done)
-      );
+      return replyEditor(control, null, parentKey, done);
     }
 
     function blocks(control) {
@@ -3000,6 +4459,7 @@
       help(box);
       let questMap = new Map();
       let data = scan(control.value);
+      const status = el('p', { class: 'dp-dialog-meta dp-help' });
       let focus = '';
       let view = 'steps';
       let limit = 60;
@@ -3022,6 +4482,7 @@
         { class: 'dp-row' },
         button('Nowa wypowiedź', () => newStep(control, refresh), 'dp-primary'),
         button('Nowa odpowiedź', () => newReply(control, '', refresh)),
+        button('Nowy krok z działaniem', () => command(control, null, refresh)),
         button('Sprawdź dialog', () => checkTalk(control)),
         button('Odśwież z pola', refresh)
       );
@@ -3041,9 +4502,10 @@
       box.body.append(
         el('p', {
           class: 'dp-help',
-          text: 'Wybierz krok lub odpowiedź, aby zmienić jej tekst, warunek albo zapis progressu. Opisy pokazują rozpoznaną treść źródła; nie odtwarzają silnika gry. Oryginalny graf i pole dialogu pozostają dostępne na stronie.'
+          text: 'Wpisuj treść rozmowy, wybieraj działania i łącz dalsze kroki. Formularze zapisują składnię poleceń za Ciebie. Warunki odpowiedzi oraz działania po kliknięciu mają osobne, zgodne z grą miejsca.'
         }),
         guide,
+        status,
         actions,
         el('div', { class: 'dp-row' }, stepsTab, usesTab),
         stepView,
@@ -3091,26 +4553,27 @@
               line.append(
                 el('p', { class: item.confidence === 'known' ? 'dp-help' : 'dp-error', text: item.note })
               );
-            if (item.editable)
+            if (item.model?.valid && !row.reply)
+              line.append(button('Edytuj działanie', () => command(control, row, refresh, item), 'dp-small'));
+            else if (row.reply && item.editable)
               line.append(
-                button(
-                  ['condition', 'visible'].includes(item.kind) ? 'Zmień warunek' : 'Zmień zapis',
-                  () => progress(control, row, refresh, item),
-                  'dp-small'
-                )
+                button('Edytuj warunki odpowiedzi', () => replyEditor(control, row, '', refresh), 'dp-small')
               );
+            if (item.model) line.append(el('p', { class: 'dp-help', text: catalog.get(item.cmd).help }));
             effects.append(line);
           });
           const buttons = el(
             'div',
             { class: 'dp-row' },
-            button('Edytuj tekst / kod', () => editLine(control, row, false, refresh))
+            button(row.reply ? 'Edytuj odpowiedź' : 'Edytuj wypowiedź', () =>
+              editLine(control, row, false, refresh)
+            )
           );
           if (!row.reply)
             buttons.append(button('Dodaj odpowiedź', () => newReply(control, row.key, refresh)));
           buttons.append(
-            button(row.reply ? 'Warunek lub czynność odpowiedzi' : 'Dodaj warunek lub zmianę', () =>
-              progress(control, row, refresh)
+            button(row.reply ? 'Działanie po kliknięciu' : 'Dodaj działanie lub warunek', () =>
+              command(control, row, refresh)
             )
           );
           const card = el(
@@ -3178,7 +4641,9 @@
           usage.append(
             el('p', {
               class: 'dp-empty',
-              text: 'Nie rozpoznano jawnych numerów progressów w obsługiwanych zapisach. Skróty i nietypowe fragmenty mogą zawierać dodatkowe użycia.'
+              text: data.rows.length
+                ? 'W odczytanym polu nie znaleziono jawnych odwołań do progressów. Same działania, np. zbieranie rośliny, nie muszą zawierać progressu. Skróty świata i zewnętrzne dialogi nie są rozwijane.'
+                : 'Nie odczytano żadnych kroków dialogu. To wynik odczytu pola, a nie potwierdzenie braku progressów. Odśwież z pola i sprawdź źródło.'
             })
           );
         data.uses.forEach((item) => {
@@ -3217,10 +4682,17 @@
         );
         data.gaps.forEach((item) =>
           uncertain.append(
-            el('p', {
-              class: 'dp-help',
-              text: 'Linia ' + item.line + (item.key ? ' · ' + item.key : '') + ': ' + item.reason
-            })
+            el(
+              'details',
+              {},
+              el('summary', {
+                text: 'Linia ' + item.line + (item.key ? ' · ' + item.key : '') + ': ' + item.reason
+              }),
+              el('pre', {
+                class: 'dp-code',
+                text: item.raw || talk(control.value).find((row) => row.index + 1 === item.line)?.raw || ''
+              })
+            )
           )
         );
         if (!data.gaps.length)
@@ -3236,6 +4708,16 @@
 
       function refresh() {
         data = scan(control.value);
+        status.textContent =
+          'Odczytano ' +
+          lines(control.value).length +
+          ' linii · ' +
+          data.rows.filter((row) => !row.reply).length +
+          ' kroków · ' +
+          data.rows.filter((row) => row.reply).length +
+          ' odpowiedzi · ' +
+          data.rows.reduce((sum, row) => sum + chunks(row.body).length, 0) +
+          ' poleceń.';
         renderRows();
         renderUses();
       }
@@ -3244,6 +4726,11 @@
         limit = 60;
         renderRows();
       });
+      const onEdit = () => {
+        if (box.box.isConnected) refresh();
+        else control.removeEventListener('input', onEdit);
+      };
+      control.addEventListener('input', onEdit);
       box.foot.append(button('Zamknij', box.close));
       refresh();
       switchView(view);
@@ -3681,6 +5168,7 @@
     const actions = new Map(
       Object.entries({
         cash: ['Zmień walutę serwerową', 'number'],
+        cash2: ['Zmień drugą walutę', 'number'],
         message: ['Pokaż wiadomość', 'text'],
         play: ['Odtwórz dźwięk z adresu', 'line'],
         talk: ['Rozpocznij rozmowę z NPC', 'npc'],
@@ -4443,8 +5931,8 @@
     const grant = (control) =>
       post(control) &&
       ((route('currency2?') && action(control) === 'editcurr') || /(?:^|\/)items\/base\/-1\/?$/.test(path));
-    const picture = (record, size = 40) =>
-      app.media?.node(record, { size }) || el('span', { class: 'dp-media', text: 'Brak grafiki' });
+    const picture = (record, kind, size = 40) =>
+      app.media?.node(record, { kind, size }) || el('span', { class: 'dp-media', text: 'Brak grafiki' });
     let serial = 0;
 
     function hint(control, message, bar) {
@@ -4480,7 +5968,7 @@
         if (control.multiple) status.append(el('span', { text: `Wybrano: ${options.length}` }));
         for (const option of options.slice(0, control.multiple ? 3 : 1)) {
           const record = records.get(option.value) || { id: option.value };
-          if (kind) status.append(picture(record));
+          if (kind) status.append(picture(record, kind));
           status.append(el('span', { text: text(option.textContent) || record.name || `#${option.value}` }));
         }
         if (control.multiple && options.length > 3)
@@ -4578,7 +6066,7 @@
           row.disabled = entry.disabled;
           row.setAttribute('aria-pressed', String(values.has(entry.value)));
           if (values.has(entry.value)) row.classList.add('dp-primary');
-          if (kind && entry.value) row.append(picture(records.get(entry.value) || { id: entry.value }));
+          if (kind && entry.value) row.append(picture(records.get(entry.value) || { id: entry.value }, kind));
           row.append(
             el(
               'span',
@@ -4616,7 +6104,7 @@
             for (const record of values) records.set(String(record.id), record);
             for (const row of area.children) {
               const record = records.get(row.dataset.dpValue);
-              if (record) q('.dp-media', row)?.replaceWith(picture(record));
+              if (record) q('.dp-media', row)?.replaceWith(picture(record, kind));
             }
           })
           .catch(() => {});
@@ -4908,8 +6396,216 @@
       const label = spec.label || `Wybierz ${title[kind]}`;
       const bar = tools(control, [[label, () => choice(control, kind, label, labels, help)]]);
       if (!bar) return;
+      if (spec.offer) offers(control, bar);
       if (help) hint(control, help, bar);
       preview(control, kind, bar);
+    }
+
+    function offers(control, bar) {
+      const match = path.match(/(?:^|\/)shop\/(\d+)(?:\/(\d+),(\d+))?\/?$/);
+      if (!match || !app.url) return;
+      const sid = match[1];
+      const base = new URL(app.url(''), location.href);
+      const slots = [];
+      for (const link of all('a.shoptd[href]', main)) {
+        if (app.root.contains(link)) continue;
+        let href;
+        try {
+          href = new URL(link.getAttribute('href'), base);
+        } catch {
+          continue;
+        }
+        const slot = href.pathname.match(/^\/world(?::([^/]+))?\/shop\/(\d+)\/(\d+),(\d+)\/?$/);
+        if (!slot || href.origin !== base.origin || href.search || href.hash || slot[2] !== sid) continue;
+        try {
+          if (
+            slot[1] &&
+            decodeURIComponent(slot[1]).toLowerCase() !==
+              String(app.world || decodeURIComponent(base.pathname.split('/')[1].slice(6))).toLowerCase()
+          )
+            continue;
+        } catch {
+          continue;
+        }
+        if (slots.some((row) => row.x === slot[3] && row.y === slot[4])) continue;
+        const image = q('img', link);
+        let data;
+        try {
+          data = JSON.parse(q('[tip]', link)?.getAttribute('tip') || 'null');
+        } catch {}
+        const valid =
+          data &&
+          String(data.sid) === sid &&
+          String(data.x) === slot[3] &&
+          String(data.y) === slot[4] &&
+          /^\d+$/.test(String(data.tid)) &&
+          Number(data.tid) > 0;
+        const tid = valid ? String(data.tid) : '';
+        const option = tid ? Array.from(control.options).find((option) => option.value === tid) : null;
+        const record = valid
+          ? {
+              id: tid,
+              name: text(data.name) || text(option?.textContent) || `Szablon #${tid}`,
+              src: data.src || image?.getAttribute('src') || ''
+            }
+          : { id: '', name: image ? 'Oferta bez odczytanych danych' : 'Puste miejsce' };
+        slots.push({
+          x: slot[3],
+          y: slot[4],
+          href: href.href,
+          active: link.classList.contains('active'),
+          filled: !!image,
+          record,
+          data: valid ? data : null
+        });
+      }
+      if (!slots.length) return;
+      const selected = slots.filter((slot) => slot.active);
+      const current =
+        match[2] !== undefined
+          ? slots.find((slot) => slot.x === match[2] && slot.y === match[3])
+          : selected.length === 1
+            ? selected[0]
+            : null;
+      const label = text(
+        Array.from(q('select.chosen-shop', main)?.options || []).find((option) => option.value === sid)
+          ?.textContent
+      );
+      const heading = label
+        ? `Sklep #${sid} · ${label.replace(new RegExp('^#?' + sid + '\\s*[-–—]?\\s*|\\s*#' + sid + '$', 'g'), '')}`
+        : `Sklep #${sid}`;
+      const box = el('section', {
+        class: 'dp-shop-context dp-card dp-stack',
+        'aria-label': 'Oferta w otwartym sklepie'
+      });
+      box.append(el('strong', { text: heading }));
+      const navigate = (event) => {
+        if (native(control)) return;
+        event.preventDefault();
+        note('Ten formularz nie jest teraz dostępny. Odśwież stronę sklepu.', 'error');
+      };
+      const open = (empty) => {
+        if (!native(control)) return note('Ten formularz nie jest teraz dostępny do edycji.', 'error');
+        const dialog = modal(empty ? 'Dodaj ofertę w tym sklepie' : 'Oferty tego sklepu');
+        const search = el('input', {
+          class: 'dp-input',
+          type: 'search',
+          placeholder: 'Nazwa, szablon lub pole sklepu'
+        });
+        const rows = slots.filter((slot) => (empty ? !slot.filled : slot.filled));
+        const list = el('div', { class: 'dp-list' });
+        const count = el('p', { class: 'dp-help', 'aria-live': 'polite' });
+        dialog.body.append(
+          el('strong', { text: heading }),
+          el('p', {
+            class: 'dp-help',
+            text: empty
+              ? 'Wybierz puste miejsce. Otworzy się formularz nowej oferty w tym sklepie; potem wybierz jej szablon.'
+              : 'To oferty zapisane w otwartym sklepie. Wybór otwiera ich właściwe pole wraz z ceną, ilością i progressem po zakupie.'
+          }),
+          field('Znajdź', search),
+          count,
+          list
+        );
+        const draw = () => {
+          const query = fold(search.value);
+          const found = rows.filter((slot) =>
+            fold(`${slot.record.name} ${slot.record.id} ${slot.x},${slot.y}`).includes(query)
+          );
+          count.textContent = `${empty ? 'Puste miejsca' : 'Oferty'}: ${found.length}`;
+          list.replaceChildren();
+          for (const slot of found) {
+            const row = el('a', {
+              class: 'dp-btn dp-item',
+              href: slot.href,
+              'data-dp-shop': sid,
+              'data-dp-slot': `${slot.x},${slot.y}`,
+              'data-dp-tid': slot.record.id,
+              on: { click: navigate }
+            });
+            if (slot === current) row.setAttribute('aria-current', 'true');
+            if (slot.filled) row.append(picture(slot.record, 'item'));
+            const details = [`Pole ${slot.x}, ${slot.y}`];
+            if (slot.record.id) details.push(`szablon #${slot.record.id}`);
+            if (slot.data)
+              details.push(
+                `cena ${slot.data.pr}`,
+                `ilość ${slot.data.amount}`,
+                slot.data.prog ? `progress: ${slot.data.prog}` : 'bez zmiany progressu'
+              );
+            row.append(
+              el(
+                'span',
+                {},
+                el('strong', { text: slot.record.name }),
+                el('small', { class: 'dp-help', text: details.join(' · ') })
+              )
+            );
+            list.append(row);
+          }
+          if (!found.length)
+            list.append(
+              el('p', {
+                class: 'dp-empty',
+                text: empty
+                  ? 'Nie ma pasujących pustych miejsc w tym sklepie.'
+                  : 'Nie ma pasujących ofert w tym sklepie.'
+              })
+            );
+        };
+        search.addEventListener('input', draw);
+        dialog.foot.append(button('Zamknij', () => dialog.close()));
+        draw();
+        search.focus();
+      };
+      box.append(
+        el(
+          'div',
+          { class: 'dp-tools' },
+          button('Edytuj ofertę tego sklepu', () => open(false)),
+          button('Dodaj ofertę', () => open(true))
+        )
+      );
+      if (current)
+        box.append(
+          el('span', {
+            class: 'dp-help',
+            text: `${current.filled ? 'Wybrana oferta' : 'Nowa oferta'} · pole ${current.x}, ${current.y}${current.record.id ? ` · ${current.record.name} · szablon #${current.record.id}` : ''}`
+          })
+        );
+      else
+        box.append(
+          el('span', {
+            class: 'dp-help',
+            text: 'Wybierz ofertę lub puste miejsce, aby otworzyć właściwy formularz sklepu.'
+          })
+        );
+      const status = el('span', { class: 'dp-help', 'aria-live': 'polite' });
+      const edit = el('a', { class: 'dp-btn', on: { click: navigate } });
+      const links = el('div', { class: 'dp-row' });
+      box.append(status, links);
+      const update = () => {
+        const id = control.value;
+        const valid = /^\d+$/.test(id) && Number(id) > 0;
+        links.replaceChildren();
+        if (valid) {
+          edit.href = app.url('items/template/' + id);
+          edit.textContent = `Otwórz szablon #${id}`;
+          links.append(edit);
+        } else edit.removeAttribute('href');
+        const changed = current && id !== current.record.id;
+        status.textContent = changed
+          ? id
+            ? 'Formularz wskazuje inny szablon niż zapisana oferta. Zapis zmieni przedmiot w tym polu sklepu.'
+            : current.filled
+              ? 'Po zapisaniu puste pole szablonu usunie tę ofertę.'
+              : ''
+          : 'Cena, ilość i progress dotyczą wyłącznie tego pola sklepu. Edycja samego szablonu otwiera osobną stronę.';
+      };
+      control.addEventListener('input', update);
+      control.addEventListener('change', update);
+      update();
+      bar.before(box);
     }
 
     const progress = path.match(/(?:^|\/)progress\/(-?\d+)(?:\/|$)/);
@@ -5090,7 +6786,9 @@
         if (type === 'editshop' && control.id === 'tid')
           return {
             kind: 'item',
-            help: 'Szablon przedmiotu sprzedawanego w wybranym miejscu sklepu. Puste pole usuwa tę ofertę po zapisaniu.',
+            offer: true,
+            label: 'Zmień szablon oferty',
+            help: 'Ta lista zmienia przedmiot w aktualnym polu sklepu. Zawiera dostępne szablony, także spoza sklepu. Aby wybrać istniejącą ofertę, użyj „Edytuj ofertę tego sklepu”. Puste pole usuwa tę ofertę po zapisaniu.',
             labels: new Map([['', 'Puste pole — usuń ofertę po zapisaniu']])
           };
         if (type === 'shopbuy' && control.id === 'buy_tid')

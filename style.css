@@ -107,7 +107,8 @@ a.dp-btn:hover {
 .dp-btn:focus-visible,
 .dp-input:focus-visible,
 .dp-select:focus-visible,
-.dp-area:focus-visible {
+.dp-area:focus-visible,
+.dp-toggle:focus-visible {
   outline: 3px solid var(--dp-accent);
   outline-offset: 2px;
 }
@@ -177,6 +178,27 @@ a.dp-primary:hover {
   display: block;
   font-weight: 500;
 }
+.dp-switch {
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.dp-switch > .dp-label {
+  flex: 1;
+}
+.dp-switch > .dp-help {
+  flex-basis: 100%;
+}
+.dp-toggle {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  min-height: 18px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--dp-accent);
+}
 .dp-help,
 .dp-muted {
   color: var(--dp-muted);
@@ -194,6 +216,8 @@ a.dp-primary:hover {
   font-weight: 400;
 }
 .dp-check input {
+  width: auto;
+  flex: 0 0 auto;
   margin: 0;
   accent-color: var(--dp-accent);
 }
@@ -417,7 +441,8 @@ a.dp-primary:hover {
   border-radius: 10px;
   background: var(--dp-bg);
 }
-button.dp-item {
+button.dp-item,
+a.dp-item {
   width: 100%;
   justify-content: flex-start;
   padding: 10px;
@@ -464,7 +489,8 @@ button.dp-item {
   font-size: 12px;
 }
 button.dp-item.dp-primary,
-button.dp-item[aria-pressed='true'] {
+button.dp-item[aria-pressed='true'],
+a.dp-item[aria-current='true'] {
   background: var(--dp-accent);
   border-color: var(--dp-accent);
   color: var(--dp-on);
@@ -472,13 +498,35 @@ button.dp-item[aria-pressed='true'] {
 button.dp-item.dp-primary .dp-help,
 button.dp-item.dp-primary small,
 button.dp-item[aria-pressed='true'] .dp-help,
-button.dp-item[aria-pressed='true'] small {
+button.dp-item[aria-pressed='true'] small,
+a.dp-item[aria-current='true'] .dp-help,
+a.dp-item[aria-current='true'] small {
   color: var(--dp-on);
 }
 .dp-item-info {
   display: flex;
   flex-direction: column;
   min-width: 0;
+}
+.dp-shop-context {
+  margin-bottom: 18px;
+}
+.dp-dialog-meta {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--dp-border);
+}
+.dp-command-fields,
+.dp-arg-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.dp-command-card {
+  padding: 12px;
+  border: 1px solid var(--dp-border);
+  border-radius: 8px;
+  background: var(--dp-bg);
 }
 .dp-star {
   flex: 0 0 32px;
