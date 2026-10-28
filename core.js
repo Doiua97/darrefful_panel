@@ -210,7 +210,7 @@
         { class: 'dp-tools' },
         actions.map(([text, fn]) => button(text, fn))
       );
-      target.before(bar);
+      (target.closest('label') || target).before(bar);
       target.dataset.dpTools = '1';
       return bar;
     }
@@ -499,11 +499,6 @@
                 id: data.id,
                 name: data.name,
                 src: imageUrl(data.src || ''),
-                cl: data.cl,
-                stat: data.stat,
-                eat: data.eat,
-                amount: data.amount,
-                pr: data.pr,
                 page: data.page,
                 origin: 'szablon'
               });
@@ -656,14 +651,26 @@
     function parseStages(text) {
       const out = new Map();
       String(text)
-        .split(/\r?\n/)
+        .split(/\r\n?|\n/)
         .forEach((line) => {
-          const match = line.match(/^\s*(-?\d+(?:\.\.-?\d*)?|\.\.-?\d+)\s+(.+)$/);
+          const match = line.match(/^\s*(-?\d+(?:\.\.(?:-?\d+)?)?|\.\.-?\d+)\s+(.+)$/);
           if (!match) return;
+          const bounds = match[1].split('..').filter(Boolean).map(Number);
+          if (
+            bounds.some((value) => !Number.isSafeInteger(value)) ||
+            (bounds.length === 2 && bounds[0] > bounds[1])
+          )
+            return;
           const heading = match[2].match(/^\s*<b>(.*?)<\/b>/i);
-          const label =
-            clean(heading ? heading[1] : match[2].replace(/#(?:TARGET|INCLUDE):\S+/g, '')).slice(0, 100) ||
-            match[1];
+          const label = out.has(match[1])
+            ? 'Kilka opisów przy wartości ' + match[1]
+            : clean(
+                heading
+                  ? heading[1]
+                  : match[2]
+                      .replace(/#TARGET:(?:NPC|MOB|ITEM|MAP|XY):[^#]*/g, '')
+                      .replace(/#INCLUDE:-?\d+/g, '')
+              ).slice(0, 100) || match[1];
           out.set(match[1], { value: match[1], label, range: match[1].includes('..') });
         });
       return Array.from(out.values());
@@ -870,9 +877,6 @@
                     ? ' · ' + record.group
                     : '')
           });
-          const img = ['progress', 'quest'].includes(kind)
-            ? el('span', { class: 'dp-item-symbol', text: '#', 'aria-hidden': 'true' })
-            : app.media.node(record, { kind });
           const use = button(
             '',
             () => {
@@ -881,7 +885,13 @@
             },
             'dp-item-use'
           );
-          use.append(img, el('span', {}, title, info));
+          if (kind !== 'player')
+            use.append(
+              ['progress', 'quest'].includes(kind)
+                ? el('span', { class: 'dp-item-symbol', text: '#', 'aria-hidden': 'true' })
+                : app.media.node(record, { kind })
+            );
+          use.append(el('span', {}, title, info));
           const star = button(
             favorite(record.id) ? '★' : '☆',
             () => {
@@ -1011,7 +1021,7 @@
                 detail.body.append(
                   el('p', { class: 'dp-help', text: label + ' · #' + record.id + ' · ' + world })
                 );
-                if (!['progress', 'quest'].includes(kind))
+                if (!['progress', 'quest', 'player'].includes(kind))
                   detail.body.append(app.media.node(record, { size: 96, kind }));
                 if (kind === 'progress') {
                   detail.body.append(
@@ -1112,18 +1122,13 @@
       if (store.set(draftKey, saved)) draftDirty = false;
     }
 
-    document.addEventListener('input', (event) => {
+    function queueDraft(event) {
       if (root.contains(event.target) || !event.target.name) return;
       draftDirty = true;
       clearTimeout(draftTimer);
       draftTimer = setTimeout(saveDraft, 800);
-    });
-    document.addEventListener('change', (event) => {
-      if (root.contains(event.target) || !event.target.name) return;
-      draftDirty = true;
-      clearTimeout(draftTimer);
-      draftTimer = setTimeout(saveDraft, 800);
-    });
+    }
+    for (const type of ['input', 'change']) document.addEventListener(type, queueDraft);
 
     function drafts() {
       const saved = store.get(draftKey, null);
@@ -1191,15 +1196,6 @@
       );
     }
 
-    function download(name, data) {
-      const src = URL.createObjectURL(
-        new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
-      );
-      const link = el('a', { href: src, download: name });
-      link.click();
-      setTimeout(() => URL.revokeObjectURL(src), 1000);
-    }
-
     function settings() {
       const box = modal('Ustawienia Darro Panel');
       const theme = select(
@@ -1214,58 +1210,7 @@
         store.set('theme', theme.value);
         document.documentElement.dataset.dpTheme = theme.value;
       });
-      box.body.append(
-        field('Wygląd dodatku', theme),
-        el('p', { class: 'dp-help', text: 'Opisy i ulubione są lokalne dla konta i świata ' + world + '.' })
-      );
-      box.body.append(
-        button('Eksportuj opisy i ulubione', () =>
-          download('darro-' + world.toLowerCase() + '.json', {
-            format: 'darro-panel-1',
-            world,
-            aliases: aliases(),
-            favorites: store.get('favorites', [])
-          })
-        )
-      );
-      const file = el('input', { type: 'file', accept: '.json,application/json', class: 'dp-input' });
-      file.addEventListener('change', async () => {
-        const chosen = file.files?.[0];
-        if (!chosen) return;
-        if (chosen.size > 1024 * 1024) return note('Plik ustawień jest zbyt duży.', 'error');
-        try {
-          const data = JSON.parse(await chosen.text());
-          if (
-            data.format !== 'darro-panel-1' ||
-            String(data.world).toLowerCase() !== world.toLowerCase() ||
-            !data.aliases ||
-            typeof data.aliases !== 'object'
-          )
-            throw new Error();
-          const next = { ...aliases() };
-          Object.entries(data.aliases).forEach(([id, meta]) => {
-            if (!/^(player|global):-?\d+$/.test(id) || !meta || typeof meta !== 'object') return;
-            next[id] = {
-              name: String(meta.name || '').slice(0, 120),
-              note: String(meta.note || '').slice(0, 1000),
-              type: String(meta.type || 'number').slice(0, 20)
-            };
-          });
-          store.set('aliases', next);
-          const favorites = Array.isArray(data.favorites)
-            ? data.favorites.filter((item) =>
-                /^(progress|quest|npc|mob|map|item|shop|player):(player|global):-?\d+(?:,\d+)?$/.test(item)
-              )
-            : [];
-          store.set('favorites', Array.from(new Set([...store.get('favorites', []), ...favorites])));
-          note('Wczytano opisy i ulubione dla tego świata.');
-        } catch {
-          note('Nieprawidłowy plik albo ustawienia innego świata.', 'error');
-        }
-      });
-      box.body.append(
-        field('Importuj opisy i ulubione', file, 'Import łączy wpisy z obecnymi ustawieniami.')
-      );
+      box.body.append(field('Wygląd dodatku', theme));
       if (bridge.configure) box.foot.append(button('Źródło plików', bridge.configure));
     }
 
@@ -1322,7 +1267,7 @@
           }),
           button('Ustawienia', settings)
         ),
-        el('small', { class: 'dp-help', text: '0.3.0 · Alt+Shift+D · zmiany zapisujesz w panelu' })
+        el('small', { class: 'dp-help', text: '0.4.0 · Alt+Shift+D · zmiany zapisujesz w panelu' })
       );
       dock.append(panel, toggle);
       root.append(dock);
@@ -1363,7 +1308,7 @@
     app.media = media(app);
     document.documentElement.dataset.dpTheme = store.get('theme', 'auto');
     shell();
-    [dialogs, items, panels].forEach((install) => {
+    [dialogs, items, panels, mobs].forEach((install) => {
       try {
         install(app);
       } catch {
@@ -2927,13 +2872,13 @@
                       ['exact', 'Numer umiejętności']
                     ]
                   : [['exact', 'Wpisana liczba']];
-        if (!fieldSpec.reply)
+        if (!fieldSpec.reply && !fieldSpec.fixed)
           modes.push(
             ['player', 'Wartość progressu gracza'],
             ['global', 'Wartość progressu świata'],
             ['random', 'Losowa liczba']
           );
-        modes.push(['macro', 'Skrót świata']);
+        if (!fieldSpec.fixed) modes.push(['macro', 'Skrót świata']);
         let mode = 'exact';
         let first = initial;
         let second = '';
@@ -3421,7 +3366,7 @@
       const data = row
         ? replyParts(row.body)
         : { words: '', icon: '', next: 'END', conditions: {}, safe: true };
-      if (!data.safe) return editLine(control, row, false, done, true);
+      if (!data.safe) return editLine(control, row, done, true);
       const box = modal(row ? 'Odpowiedź ' + row.key : 'Nowa odpowiedź gracza');
       help(box);
       const parent = select(
@@ -4261,7 +4206,7 @@
       box.body.append(
         el('p', {
           class: 'dp-help',
-          text: 'Zmiany trafiają do formularza. Zapis na stronie wykonujesz jej przyciskiem „Zapisz zmiany”.'
+          text: 'Zmiany trafiają do formularza. Zapisz je przyciskiem zapisu na stronie.'
         })
       );
     }
@@ -4354,33 +4299,29 @@
       return update;
     }
 
-    function editLine(control, row, quest = false, done = () => {}, rawReply = false) {
-      if (row.reply && !quest && !rawReply) return replyEditor(control, row, '', done);
+    function editLine(control, row, done = () => {}, rawReply = false) {
+      if (row.reply && !rawReply) return replyEditor(control, row, '', done);
       const source = control.value;
       if (source.slice(row.start, row.end) !== row.raw) {
         note('Ta linia zmieniła się. Otwórz ją ponownie.', 'error');
         return;
       }
-      const box = modal(quest ? 'Etap ' + row.key : (row.reply ? 'Odpowiedź ' : 'Krok ') + row.key);
+      const box = modal((row.reply ? 'Odpowiedź ' : 'Krok ') + row.key);
       help(box);
       const part = chunks(row.body)[0];
-      const split = quest || row.reply ? row.body.length : (part?.start ?? row.body.length);
+      const split = row.reply ? row.body.length : (part?.start ?? row.body.length);
       const before = row.body.slice(0, split);
       const plain = before.replace(/[ \t]+$/, '');
       const code = row.body.slice(split);
       const words = area(plain, 5);
       box.body.append(
         field(
-          quest
-            ? 'Opis etapu'
-            : row.reply
-              ? 'Treść odpowiedzi z jej warunkami i przejściem'
-              : 'Wypowiedź NPC',
+          row.reply ? 'Treść odpowiedzi z jej warunkami i przejściem' : 'Wypowiedź NPC',
           words,
           'Nowe wiersze zostaną zapisane jako <br>. Pozostałe linie dialogu zachowają oryginalną postać.'
         )
       );
-      if (!quest) tokens(box.body, words, false);
+      tokens(box.body, words, false);
       if (code)
         box.body.append(
           el(
@@ -4404,7 +4345,7 @@
             if (/[\r\n]/.test(raw.value))
               throw new Error('Tutaj edytujesz jedną linię. Nowe kroki dodaj osobno.');
             next = raw.value;
-            const parsed = (quest ? quests(next) : talk(next))[0];
+            const parsed = talk(next)[0];
             if (!parsed || parsed.key !== row.key)
               throw new Error(
                 'Zachowaj numer tej linii. Zmiana numeru wymaga osobnej aktualizacji powiązań.'
@@ -4565,9 +4506,7 @@
           const buttons = el(
             'div',
             { class: 'dp-row' },
-            button(row.reply ? 'Edytuj odpowiedź' : 'Edytuj wypowiedź', () =>
-              editLine(control, row, false, refresh)
-            )
+            button(row.reply ? 'Edytuj odpowiedź' : 'Edytuj wypowiedź', () => editLine(control, row, refresh))
           );
           if (!row.reply)
             buttons.append(button('Dodaj odpowiedź', () => newReply(control, row.key, refresh)));
@@ -4880,205 +4819,572 @@
       box.foot.append(button('Zamknij', box.close));
     }
 
-    function newStage(control) {
+    function questParts(body) {
+      const title = body.match(/^<b>(.*?)<\/b><br>/i);
+      body = body.slice(title?.[0].length || 0);
+      const parts = [];
+      let cursor = 0;
+      const pattern =
+        /(^|[ \t])#TARGET:(NPC|MOB|ITEM|MAP|XY):|(^|[ \t])#INCLUDE:(\d+)(?![\w.])|\[PVAL:(-?\d+)\]\/(\d+)/g;
+      pattern.lastIndex = cursor;
+      let match;
+      while ((match = pattern.exec(body))) {
+        const start = match.index + (match[1] || match[3] || '').length;
+        if (start > cursor) parts.push({ kind: 'text', raw: body.slice(cursor, start) });
+        let end = pattern.lastIndex;
+        const part = match[2]
+          ? { kind: 'target', type: match[2] }
+          : match[4]
+            ? { kind: 'include', value: match[4] }
+            : { kind: 'counter', value: match[5], count: match[6] };
+        if (part.kind === 'target') {
+          const next = body.slice(end).search(/[ \t]+(?:#[A-Z][A-Z0-9_]*(?::|\b)|\[PVAL:-?\d+\]\/\d+)/);
+          end = next < 0 ? body.length : end + next;
+          while (end > pattern.lastIndex && /[ \t]/.test(body[end - 1])) end--;
+          part.value = body.slice(pattern.lastIndex, end);
+        }
+        part.raw = body.slice(start, end);
+        parts.push(part);
+        cursor = end;
+        pattern.lastIndex = end;
+      }
+      if (cursor < body.length) parts.push({ kind: 'text', raw: body.slice(cursor) });
+      return { title: title?.[1] || '', head: title?.[0] || '', parts };
+    }
+
+    function questBounds(key) {
+      if (int(key)) return [Number(key), Number(key)];
+      const [first, last] = key.split('..');
+      return [first ? Number(first) : -Infinity, last ? Number(last) : Infinity];
+    }
+
+    function questOverlap(rows, key, skip = -1) {
+      if (!range(key)) return [];
+      const [a, b] = questBounds(key);
+      return rows.filter(
+        (row) =>
+          row.key &&
+          row.index !== skip &&
+          Math.max(a, questBounds(row.key)[0]) <= Math.min(b, questBounds(row.key)[1])
+      );
+    }
+
+    function questText(source, row, key, body, copy = false, remove = false) {
+      if (row && source.slice(row.start, row.end) !== row.raw)
+        throw new Error('Ten etap zmienił się. Otwórz go ponownie.');
+      if (remove) return source.slice(0, row.start) + source.slice(row.end + row.eol.length);
+      if (row && !copy && key === row.key && body === row.body) return source;
+      if (!range(key)) throw new Error('Podaj liczbę całkowitą albo poprawne granice przedziału.');
+      if (
+        (!row || copy || key !== row.key) &&
+        quests(source).some(
+          (other) =>
+            other.key &&
+            (copy || other.index !== row?.index) &&
+            questBounds(other.key).every((value, index) => value === questBounds(key)[index])
+        )
+      )
+        throw new Error('Opis dla tej wartości lub tego samego zakresu już istnieje.');
+      if (!body.trim()) throw new Error('Dodaj opis, licznik albo opis innego zadania.');
+      const prefix = row && !copy ? key + row.prefix.slice(row.key.length) : key + ' ';
+      return row && !copy ? replace(source, row, prefix + body) : append(source, [prefix + body]);
+    }
+
+    function questBody(head, parts) {
+      const active = parts.filter((part) => part.value);
+      let body = head;
+      active.forEach((part, index) => {
+        if (
+          body &&
+          (['target', 'include'].includes(part.kind)
+            ? body !== head && !/\s$/.test(body)
+            : part.fresh && !/(?:\s|<br>)$/.test(body))
+        )
+          body += ' ';
+        body += part.value;
+        if (part.fresh && active[index + 1] && !/^[\s.,!?;:]/.test(active[index + 1].value)) body += ' ';
+      });
+      return body;
+    }
+
+    function questRef(kind, label, initial = '', named = false) {
+      const value = input(initial);
+      const preview = el('div', { class: 'dp-row' });
+      const box = el(
+        'div',
+        { class: 'dp-stack' },
+        field(label, value),
+        el(
+          'div',
+          { class: 'dp-row' },
+          button('Wybierz z listy', () =>
+            app.pick(
+              kind,
+              (record) => {
+                value.value = String(named ? record.name : record.id);
+                show(record);
+                changed(value);
+              },
+              { value: named ? '' : value.value, scope: 'player' }
+            )
+          ),
+          preview
+        )
+      );
+      function show(record) {
+        preview.replaceChildren();
+        if (!record) return;
+        if (app.media && ['npc', 'mob', 'item', 'map'].includes(kind))
+          preview.append(app.media.node(record, { kind, size: 40 }));
+        preview.append(el('span', { class: 'dp-help', text: record.name + ' · #' + record.id }));
+      }
+      const load = () => {
+        const before = value.value;
+        if (!before || !app.list) return show(null);
+        app
+          .list(kind, { scope: 'player' })
+          .then((records) => {
+            if (!box.isConnected || value.value !== before) return;
+            const found = records.filter((record) => String(record.id) === before || record.name === before);
+            show(found.length === 1 ? found[0] : null);
+          })
+          .catch(() => {});
+      };
+      value.addEventListener('input', () => {
+        show(null);
+        load();
+      });
+      queueMicrotask(load);
+      return { box, input: value, value: () => value.value.trim() };
+    }
+
+    function questEditor(control, row = null, done = () => {}, copy = false) {
+      if (!app.check(control)) return;
       const source = control.value;
-      const box = modal('Nowy etap zadania');
+      if (row && source.slice(row.start, row.end) !== row.raw)
+        return note('Ten etap zmienił się. Otwórz go ponownie.', 'error');
+      const data = questParts(row?.body || '');
+      const box = modal(copy ? 'Kopia etapu zadania' : row ? 'Edycja etapu zadania' : 'Nowy etap zadania');
       help(box);
-      const value = input('', { placeholder: 'Np. 0, 1, 2.. lub 3..5' });
-      const words = area('', 5);
+      const value = arg(
+        f('value', 'Opis widoczny, gdy progress ma wartość', 'range', { fixed: true }),
+        row && !copy ? row.key : ''
+      );
+      value.box.append(
+        el('p', {
+          class: 'dp-help',
+          text: 'To warunek wyświetlenia opisu. Zmiana tutaj nie ustawia wartości u graczy ani nie zmienia poleceń NPC.'
+        })
+      );
+      const title = input(data.title);
+      const headed = el('input', { type: 'checkbox', checked: !!data.head });
+      const titleBox = field('Tytuł zadania w łańcuchu', title);
+      titleBox.hidden = !headed.checked;
+      headed.addEventListener('change', () => {
+        titleBox.hidden = !headed.checked;
+      });
+      const overlap = el('p', { class: 'dp-help' });
+      const parts = data.parts;
+      if (!row) parts.push({ kind: 'text', raw: '', fresh: true });
+      const list = el('div', { class: 'dp-stack dp-quest-parts' });
+      const kind = select(
+        [
+          ['text', 'Tekst opisu'],
+          ['counter', 'Licznik progressu'],
+          ['include', 'Aktualny opis innego zadania'],
+          ['NPC', 'Cel: NPC'],
+          ['MOB', 'Cel: potwory'],
+          ['ITEM', 'Cel: źródła przedmiotu'],
+          ['MAP', 'Cel: mapa'],
+          ['XY', 'Cel: miejsce na mapie']
+        ],
+        'text'
+      );
+      const position = select([['end', 'Na końcu opisu, przed celami']]);
+      const names = {
+        text: 'Tekst opisu',
+        counter: 'Licznik',
+        include: 'Opis innego zadania',
+        target: 'Cel strzałki'
+      };
+      function positions() {
+        const old = position.value;
+        position.replaceChildren(
+          el('option', { value: 'end', text: 'Na końcu opisu, przed celami' }),
+          ...parts
+            .map((part, index) =>
+              part.raw.trim() || part.fresh
+                ? el('option', { value: index, text: 'Po części ' + (index + 1) + ': ' + names[part.kind] })
+                : null
+            )
+            .filter(Boolean)
+        );
+        position.value = [...position.options].some((option) => option.value === old) ? old : 'end';
+      }
+      function addPart(part, at = parts.length) {
+        const card = el('article', { class: 'dp-card', 'data-quest-part': part.kind });
+        let read;
+        if (part.kind === 'text') {
+          const initial = part.raw.trim().replace(/<br>/gi, '\n');
+          const text = area(initial, 3);
+          card.append(field('Tekst opisu', text, 'Nowy wiersz tworzy podział tekstu w dzienniku.'));
+          read = () =>
+            text.value === initial
+              ? part.raw
+              : part.raw.match(/^\s*/)[0] + textLine(text.value) + part.raw.match(/\s*$/)[0];
+        } else if (part.kind === 'counter' || part.kind === 'include') {
+          const counter = part.kind === 'counter';
+          const pick = questRef(
+            counter ? 'progress' : 'quest',
+            counter ? 'Progress licznika gracza' : 'Zadanie do wczytania',
+            part.value
+          );
+          const amount = input(part.count || '1', { inputmode: 'numeric' });
+          card.append(el('strong', { text: names[part.kind] }), pick.box);
+          if (counter)
+            card.append(
+              field('Wymagana liczba', amount, 'Tworzy misję z paskiem. Odczytuje progress; nie zwiększa go.')
+            );
+          else
+            card.append(
+              el('p', { class: 'dp-help', text: 'Wstawia opis aktualnego etapu wybranego zadania.' })
+            );
+          const initial = [pick.value(), amount.value].join('|');
+          read = () => {
+            if (!part.fresh && [pick.value(), amount.value].join('|') === initial) return part.raw;
+            if (!int(pick.value()) || (!counter && Number(pick.value()) <= 0))
+              throw new Error('Wybierz ' + (counter ? 'progress licznika.' : 'zadanie do wczytania.'));
+            if (counter && (!natural(amount.value) || Number(amount.value) < 1))
+              throw new Error('Cel licznika musi być dodatnią liczbą całkowitą.');
+            return counter ? '[PVAL:' + pick.value() + ']/' + amount.value : '#INCLUDE:' + pick.value();
+          };
+        } else {
+          const type = select(
+            [
+              ['NPC', 'NPC'],
+              ['MOB', 'Potwory'],
+              ['ITEM', 'Źródła przedmiotu'],
+              ['MAP', 'Mapa'],
+              ['XY', 'Miejsce na mapie']
+            ],
+            part.type
+          );
+          const fields = el('div', { class: 'dp-stack' });
+          let get;
+          function layout() {
+            fields.replaceChildren();
+            const initial = type.value === part.type ? part.value || '' : '';
+            if (type.value === 'MOB') {
+              const choices = [];
+              const entries = el('div', { class: 'dp-stack' });
+              fields.append(entries);
+              const add = (name = '') => {
+                const pick = questRef('mob', 'Nazwa potwora', name, true);
+                const item = { pick };
+                const line = el(
+                  'div',
+                  { class: 'dp-row' },
+                  pick.box,
+                  button(
+                    'Usuń potwora',
+                    () => {
+                      choices.splice(choices.indexOf(item), 1);
+                      line.remove();
+                      changed(fields);
+                    },
+                    'dp-small'
+                  )
+                );
+                choices.push(item);
+                entries.append(line);
+              };
+              (initial ? initial.split(',') : ['']).forEach(add);
+              fields.append(
+                button('Dodaj potwora', () => {
+                  add();
+                  changed(fields);
+                })
+              );
+              get = () => {
+                const values = choices.map((item) => item.pick.value());
+                if (!values.length || values.some((name) => !name || /[,#\r\n]/.test(name)))
+                  throw new Error(
+                    'Wybierz potwory po nazwach, bez przecinka i znaku # w pojedynczej nazwie.'
+                  );
+                return values.join(',');
+              };
+            } else {
+              const xy = type.value === 'XY';
+              const values = xy ? initial.split(',') : [initial];
+              const pick = questRef(
+                { NPC: 'npc', ITEM: 'item', MAP: 'map', XY: 'map' }[type.value],
+                type.value === 'NPC'
+                  ? 'NPC: nazwa lub ID'
+                  : type.value === 'ITEM'
+                    ? 'Szablon przedmiotu'
+                    : 'Mapa',
+                values[0]
+              );
+              fields.append(pick.box);
+              const x = input(values[1] || '', { inputmode: 'numeric' }),
+                y = input(values[2] || '', { inputmode: 'numeric' });
+              if (xy) fields.append(el('div', { class: 'dp-grid' }, field('X', x), field('Y', y)));
+              if (type.value === 'ITEM')
+                fields.append(
+                  el('p', {
+                    class: 'dp-help',
+                    text: 'Strzałka szuka potworów upuszczających przedmiot, sklepów i NPC, którzy go dają.'
+                  })
+                );
+              get = () => {
+                const ref = pick.value();
+                if (type.value === 'NPC' ? !ref || /[#\r\n]/.test(ref) : !natural(ref) || Number(ref) < 1)
+                  throw new Error('Wybierz prawidłowy cel strzałki.');
+                if (xy && (!natural(x.value) || !natural(y.value)))
+                  throw new Error('Podaj nieujemne współrzędne x i y.');
+                return xy ? ref + ',' + x.value + ',' + y.value : ref;
+              };
+            }
+          }
+          card.append(field('Cel strzałki', type), fields);
+          layout();
+          let before;
+          try {
+            before = get();
+          } catch {
+            before = null;
+          }
+          let dirty = false;
+          fields.addEventListener('input', () => {
+            dirty = true;
+          });
+          fields.addEventListener('change', () => {
+            dirty = true;
+          });
+          type.addEventListener('change', () => {
+            dirty = true;
+            layout();
+          });
+          read = () => {
+            if (!part.fresh && !dirty && type.value === part.type) return part.raw;
+            const next = get();
+            return !part.fresh && type.value === part.type && next === before
+              ? part.raw
+              : '#TARGET:' + type.value + ':' + next;
+          };
+        }
+        const remove = button(
+          'Usuń część',
+          () => {
+            part.removed = !part.removed;
+            card.classList.toggle('dp-muted', part.removed);
+            remove.textContent = part.removed ? 'Przywróć część' : 'Usuń część';
+            changed(card);
+          },
+          'dp-small'
+        );
+        card.append(remove);
+        part.read = () => (part.removed ? '' : read());
+        part.card = card;
+        if (part.fresh && !parts.includes(part)) parts.splice(at, 0, part);
+        list.replaceChildren(
+          ...parts.filter((item) => item.card && (item.raw.trim() || item.fresh)).map((item) => item.card)
+        );
+        positions();
+      }
+      parts.forEach((part) => addPart(part));
+      const add = button('Dodaj część', () => {
+        const target = /^[A-Z]+$/.test(kind.value);
+        const index = target
+          ? parts.length
+          : position.value === 'end'
+            ? parts.findIndex((part) => part.kind === 'target')
+            : Number(position.value) + 1;
+        addPart(
+          {
+            kind: target ? 'target' : kind.value,
+            type: target ? kind.value : '',
+            value: '',
+            raw: '',
+            fresh: true
+          },
+          index < 0 ? parts.length : index
+        );
+        changed(list);
+      });
+      kind.addEventListener('change', () => {
+        position.parentElement.hidden = /^[A-Z]+$/.test(kind.value);
+      });
       box.body.append(
-        field('Wartość progressu lub zakres', value),
-        field('Opis etapu', words, 'Nowe wiersze zostaną zapisane jako <br>.')
+        value.box,
+        overlap,
+        field(
+          'Osobne zadanie w łańcuchu',
+          headed,
+          'Tytuł etapu tworzy osobne zadanie; nazwa całego questa zostaje nazwą łańcucha.'
+        ),
+        titleBox,
+        list,
+        el(
+          'div',
+          { class: 'dp-row' },
+          field('Dodaj do etapu', kind),
+          field('Miejsce nowej części', position),
+          add
+        )
       );
       review(
         box,
         () => {
-          const key = value.value.trim();
-          if (!range(key)) throw new Error('Podaj liczbę całkowitą albo zakres, np. 2.. lub 3..5.');
-          if (quests(source).some((row) => row.key === key))
-            throw new Error('Ten etap już istnieje. Otwórz go w edytorze etapów.');
-          if (!words.value.trim()) throw new Error('Wpisz opis etapu.');
-          const line = key + ' ' + textLine(words.value);
-          return { text: append(source, [line]), code: line };
+          const key = value.value();
+          const conflicts = questOverlap(quests(source), key, copy ? -1 : row?.index);
+          overlap.textContent = conflicts.length
+            ? 'Ten zakres nakłada się na: ' +
+              conflicts.map((item) => item.key).join(', ') +
+              '. Sprawdź warunki; dodatek zachowuje kolejność i nie wybiera za silnik.'
+            : '';
+          let head = headed.checked
+            ? data.head && title.value === data.title
+              ? data.head
+              : '<b>' + title.value + '</b><br>'
+            : '';
+          if (
+            headed.checked &&
+            (!data.head || title.value !== data.title) &&
+            (!title.value.trim() || /[\r\n]/.test(title.value))
+          )
+            throw new Error('Wpisz tytuł w jednym wierszu.');
+          const body = questBody(
+            head,
+            parts.map((part) => ({ kind: part.kind, value: part.read(), fresh: part.fresh }))
+          );
+          const text = questText(source, row, key, body, copy);
+          return { text, code: (row && !copy ? key + row.prefix.slice(row.key.length) : key + ' ') + body };
         },
-        (result) => apply(control, source, result.text)
+        (result) => apply(control, source, result.text, done)
       );
     }
 
     function stageList(control) {
+      if (!app.check(control)) return;
       const box = modal('Etapy zadania');
       help(box);
+      const id = app.path.match(/(?:^|\/)quest,(-?\d+)/)?.[1];
+      const search = input('', { type: 'search', placeholder: 'Opis, wartość progressu, cel lub licznik…' });
+      const list = el('div', { class: 'dp-stack' });
+      const status = el('p', { class: 'dp-help' });
       box.body.append(
+        el('strong', { text: id ? 'Progress gracza #' + id : 'Etapy według progressu tego zadania' }),
         el('p', {
           class: 'dp-help',
-          text: 'Numer zadania odpowiada numerowi progressu gracza. Poszczególne wartości lub zakresy wybierają pokazywany opis.'
+          text: 'ID zadania jest ID progressu gracza. Wartość lub przedział wybiera opis; edycja opisu nie zmienia wartości u graczy. Autostart nadaje 0 tylko graczom, którzy nie mają jeszcze tego questa.'
         }),
-        button(
-          'Dodaj etap',
-          () => {
-            box.close();
-            newStage(control);
-          },
-          'dp-primary'
-        )
+        el(
+          'div',
+          { class: 'dp-row' },
+          button('Dodaj etap', () => questEditor(control, null, render), 'dp-primary'),
+          button('Odśwież z pola', render),
+          id
+            ? el('a', { class: 'dp-btn', href: app.url('progress/' + id), text: 'Wartości tego progressu' })
+            : null
+        ),
+        field('Szukaj etapu', search),
+        status,
+        list
       );
-      const rows = quests(control.value).filter((row) => row.key);
-      if (!rows.length)
-        box.body.append(
-          el('p', {
-            class: 'dp-empty',
-            text: 'Nie znaleziono etapów w rozpoznanym formacie. Oryginalna treść pozostaje bez zmian.'
-          })
-        );
-      rows.forEach((row) =>
-        box.body.append(
-          el(
-            'article',
-            { class: 'dp-card' },
-            el('strong', { text: 'Progress: ' + row.key }),
-            el('p', { class: 'dp-preview', text: row.body }),
+      function render() {
+        const source = control.value;
+        const rows = quests(source);
+        const act = (run) => () => {
+          if (control.value !== source)
+            return note('Pole zmieniło się. Odśwież listę etapów przed edycją.', 'error');
+          run();
+        };
+        const stages = rows.filter((row) => row.key);
+        const unknown = rows.filter((row) => !row.key && row.raw.trim());
+        status.textContent =
+          'Etapy: ' + stages.length + (unknown.length ? ' · inne linie zachowane: ' + unknown.length : '');
+        list.replaceChildren();
+        stages
+          .filter((row) => row.raw.toLocaleLowerCase('pl').includes(search.value.toLocaleLowerCase('pl')))
+          .forEach((row) => {
+            const data = questParts(row.body);
+            const summary = data.parts
+              .map((part) =>
+                part.kind === 'text'
+                  ? clean(part.raw)
+                  : part.kind === 'counter'
+                    ? 'Licznik progressu #' + part.value + ' / ' + part.count
+                    : part.kind === 'include'
+                      ? 'Opis zadania #' + part.value
+                      : 'Cel ' + part.type + ': ' + part.value
+              )
+              .filter(Boolean)
+              .join(' ');
+            const overlap = questOverlap(stages, row.key, row.index);
+            const card = el(
+              'article',
+              { class: 'dp-card dp-quest-stage', 'data-stage': row.index },
+              el('strong', { text: 'Wartość progressu: ' + valueText(row.key) }),
+              data.title ? el('h3', { text: clean(data.title) }) : null,
+              el('p', { class: 'dp-preview', text: summary }),
+              overlap.length
+                ? el('p', {
+                    class: 'dp-help',
+                    text: 'Nakłada się na opisy: ' + overlap.map((item) => item.key).join(', ') + '.'
+                  })
+                : null,
+              el(
+                'div',
+                { class: 'dp-row' },
+                button(
+                  'Edytuj etap',
+                  act(() => questEditor(control, row, render))
+                ),
+                button(
+                  'Powiel etap',
+                  act(() => questEditor(control, row, render, true))
+                ),
+                button(
+                  'Usuń opis etapu',
+                  act(() => {
+                    try {
+                      apply(control, source, questText(source, row, '', '', false, true), render);
+                    } catch (error) {
+                      note(error.message, 'error');
+                    }
+                  }),
+                  'dp-danger'
+                )
+              )
+            );
+            list.append(card);
+          });
+        if (!stages.length)
+          list.append(
+            el('p', {
+              class: 'dp-empty',
+              text: 'Dodaj pierwszy etap. Nierozpoznane linie pozostają w polu źródłowym.'
+            })
+          );
+        if (unknown.length)
+          list.append(
             el(
-              'div',
-              { class: 'dp-row' },
-              button('Edytuj opis', () => {
-                box.close();
-                editLine(control, row, true);
-              }),
-              button('Cel lub licznik', () => {
-                box.close();
-                questMark(control, String(row.index));
-              })
+              'details',
+              {},
+              el('summary', { text: 'Pozostałe linie źródła' }),
+              el('pre', { class: 'dp-code', text: unknown.map((row) => row.raw).join('\n') })
             )
-          )
-        )
-      );
-      box.foot.append(button('Zamknij', box.close));
-    }
-
-    function targetMark(body, marker, overwrite) {
-      const matches = [...body.matchAll(/(^| )#TARGET:[A-Z]+:/g)];
-      if (!matches.length) return body + (body && !/\s$/.test(body) ? ' ' : '') + marker;
-      if (matches.length > 1)
-        throw new Error('Ten opis ma kilka znaczników celu. Zachowano je; wybierz jeden do zmiany w źródle.');
-      if (!overwrite) throw new Error('Ten etap ma już cel. Zaznacz zastąpienie istniejącego celu.');
-      const start = matches[0].index + matches[0][1].length;
-      const next = body.indexOf(' #', start + 1);
-      const end = next < 0 ? body.length : next;
-      return body.slice(0, start) + marker + body.slice(end);
-    }
-
-    function questMark(control, chosen = '') {
-      const source = control.value;
-      const caret = { start: control.selectionStart, end: control.selectionEnd };
-      const rows = quests(source).filter((row) => row.key);
-      const box = modal('Cel, licznik lub powiązanie zadania');
-      help(box);
-      const rowChoice = select(
-        [['', 'Wybierz etap…'], ...rows.map((row) => [String(row.index), row.key + ' · ' + short(row.body)])],
-        chosen
-      );
-      const type = select(
-        [
-          ['npc', 'Cel: NPC'],
-          ['mob', 'Cel: potwór'],
-          ['item', 'Cel: przedmiot'],
-          ['map', 'Cel: mapa'],
-          ['xy', 'Cel: współrzędne na mapie'],
-          ['counter', 'Licznik progressu'],
-          ['include', 'Opis innego zadania']
-        ],
-        'npc'
-      );
-      let record = null;
-      const selected = el('p', { class: 'dp-help', text: 'Wybierz obiekt z katalogu.' });
-      let update = () => {};
-      const pick = button('Wybierz obiekt', () => {
-        const kind =
-          type.value === 'xy'
-            ? 'map'
-            : type.value === 'counter'
-              ? 'progress'
-              : type.value === 'include'
-                ? 'quest'
-                : type.value;
-        app.pick(kind, (item) => {
-          record = item;
-          selected.textContent = '#' + item.id + ' · ' + (item.name || 'Bez nazwy');
-          update();
-        });
-      });
-      const x = input('', { inputmode: 'numeric' });
-      const y = input('', { inputmode: 'numeric' });
-      const xy = el('div', { class: 'dp-grid' }, field('X', x), field('Y', y));
-      const amount = input('10', { inputmode: 'numeric' });
-      const amountField = field('Cel licznika', amount);
-      const position = select(
-        [
-          ['end', 'Na końcu opisu'],
-          ['cursor', 'W zaznaczonym miejscu źródła']
-        ],
-        'end'
-      );
-      const positionField = field('Miejsce znacznika', position);
-      const overwrite = el('input', { type: 'checkbox' });
-      const overwriteField = field('Zastąp istniejący cel tego etapu', overwrite);
-      box.body.append(
-        field('Etap', rowChoice),
-        field('Co wstawić', type),
-        pick,
-        selected,
-        xy,
-        amountField,
-        positionField,
-        overwriteField
-      );
-      const layout = () => {
-        xy.hidden = type.value !== 'xy';
-        amountField.hidden = type.value !== 'counter';
-        positionField.hidden = !['counter', 'include'].includes(type.value);
-        overwriteField.hidden = ['counter', 'include'].includes(type.value);
+          );
+      }
+      search.addEventListener('input', render);
+      const onEdit = () => {
+        if (box.box.isConnected) render();
+        else control.removeEventListener('input', onEdit);
       };
-      type.addEventListener('change', () => {
-        record = null;
-        selected.textContent = 'Wybierz obiekt z katalogu.';
-        layout();
-      });
-      layout();
-      update = review(
-        box,
-        () => {
-          const row = rows.find((item) => String(item.index) === rowChoice.value);
-          if (!row) throw new Error('Wybierz etap zadania.');
-          if (!record) throw new Error('Wybierz obiekt.');
-          let marker;
-          if (type.value === 'counter') {
-            if (!natural(amount.value) || Number(amount.value) === 0)
-              throw new Error('Cel licznika musi być dodatnią liczbą całkowitą.');
-            marker = '[PVAL:' + record.id + ']/' + amount.value;
-          } else if (type.value === 'include') marker = '#INCLUDE:' + record.id;
-          else if (type.value === 'xy') {
-            if (!natural(x.value) || !natural(y.value))
-              throw new Error('Współrzędne muszą być nieujemnymi liczbami całkowitymi.');
-            marker = '#TARGET:XY:' + record.id + ',' + x.value + ',' + y.value;
-          } else {
-            const ref = ['npc', 'mob'].includes(type.value) ? record.name : record.id;
-            if (!ref || /[\r\n#]/.test(ref))
-              throw new Error('Ten obiekt nie ma nazwy odpowiedniej dla znacznika celu.');
-            marker = '#TARGET:' + type.value.toUpperCase() + ':' + ref;
-          }
-          if (['counter', 'include'].includes(type.value) && position.value === 'cursor') {
-            if (caret.start < row.start + row.offset || caret.end > row.end)
-              throw new Error('Zaznacz miejsce w opisie tego etapu przed otwarciem kreatora.');
-            return { text: source.slice(0, caret.start) + marker + source.slice(caret.end), code: marker };
-          }
-          const body = ['counter', 'include'].includes(type.value)
-            ? row.body + (row.body && !/\s$/.test(row.body) ? ' ' : '') + marker
-            : targetMark(row.body, marker, overwrite.checked);
-          const raw = row.prefix + body;
-          return { text: replace(source, row, raw), code: raw };
-        },
-        (result) => apply(control, source, result.text)
-      );
+      control.addEventListener('input', onEdit);
+      box.foot.append(button('Zamknij', box.close));
+      render();
     }
 
     function mark(control) {
@@ -5123,13 +5429,7 @@
     app
       .all('textarea[name="npc_d"]')
       .filter((control) => app.check(control))
-      .forEach((control) =>
-        app.tools(control, [
-          ['Etapy zadania', () => stageList(control)],
-          ['Dodaj etap', () => newStage(control)],
-          ['Cel lub licznik', () => questMark(control)]
-        ])
-      );
+      .forEach((control) => app.tools(control, [['Etapy zadania', () => stageList(control)]]));
     app
       .all('input[name="mark"]')
       .filter((control) => app.check(control))
@@ -5137,7 +5437,6 @@
   }
 
   function items(app) {
-    if (!/(^|\/)items\//.test(app.path)) return;
     const { q, all, el, button, select, field, tools, set, modal, note, pick, check } = app;
     const specs = new Map(
       Object.entries({
@@ -5154,6 +5453,7 @@
         bag: ['Parametr torby · bag', 'number'],
         rarity: ['Rzadkość', 'rarity'],
         petslot: ['Miejsce wyposażenia maskotki', 'line'],
+        pet: ['Nazwa i grafika maskotki', 'pet'],
         unique: ['Unikatowy', 'flag'],
         heroic: ['Heroiczny', 'flag'],
         legendary: ['Legendarny', 'flag'],
@@ -5276,13 +5576,64 @@
       return base + (added.length && base && !base.endsWith(';') ? ';' : '') + added.join(';');
     }
 
-    function statEditor() {
-      if (!check(stat)) return;
-      const source = stat.value;
+    function petFields(value, fresh, refresh) {
+      const pair = value.match(/^([^,]+),(https?:\/\/.+)$/);
+      if (!pair && !fresh) return null;
+      const name = input(pair?.[1] || ''),
+        url = input(pair?.[2] || '');
+      const wrap = el('div', { class: 'dp-stack' }),
+        preview = el('div');
+      const draw = () => {
+        preview.replaceChildren();
+        const pic = image(url.value, name.value);
+        if (pic) {
+          pic.className = 'dp-stat-image';
+          preview.append(pic);
+        }
+      };
+      wrap.append(field('Nazwa maskotki', name), field('Adres grafiki maskotki', url), preview);
+      for (const control of [name, url])
+        control.addEventListener('input', () => {
+          draw();
+          refresh();
+        });
+      draw();
+      return {
+        node: wrap,
+        read: () => {
+          const result = name.value + ',' + url.value;
+          if (result === value) return value;
+          if (!name.value.trim() || name.value.includes(',')) error('Podaj nazwę maskotki bez przecinka.');
+          try {
+            const address = new URL(url.value);
+            if (!['http:', 'https:'].includes(address.protocol)) throw new Error();
+          } catch {
+            error('Podaj pełny adres HTTP lub HTTPS grafiki maskotki.');
+          }
+          return result;
+        }
+      };
+    }
+
+    function statEditor(
+      control,
+      {
+        title = 'Statystyki przedmiotu',
+        specs: defs = specs,
+        hints: tips = hints,
+        help: helpId = '#hideInfo1',
+        intro = '',
+        submit = 'Uzupełnij statystyki'
+      } = {}
+    ) {
+      if (!check(control)) return;
+      const source = control.value;
       const parts = statParts(source),
         extra = [];
-      const box = modal('Statystyki przedmiotu');
-      const rows = el('div', { class: 'dp-stack' });
+      const box = modal(title);
+      const rows = el('div', { class: 'dp-stat-grid' });
+      const search = input();
+      search.placeholder = 'Nazwa parametru lub wartość…';
       const preview = el('pre', { class: 'dp-code' });
       const status = el('p', { class: 'dp-help' });
       const refresh = () => {
@@ -5294,12 +5645,17 @@
         }
       };
       function addRow(part) {
-        const spec = specs.get(part.key);
-        if (!spec || (spec[1] === 'flag') !== part.eq < 0) return false;
+        if (!part.key) return;
+        const known = defs.get(part.key);
+        const spec =
+          known && (known[1] === 'flag') === part.eq < 0 ? known : [part.key, part.eq < 0 ? 'flag' : 'line'];
         const initial = part.value.trim();
-        let control;
-        if (spec[1] === 'flag') control = el('input', { type: 'checkbox', checked: true, class: 'dp-check' });
-        else if (spec[1] === 'text') control = area(initial);
+        const row = el('div', { class: 'dp-card dp-stat-row', 'data-stat-key': part.key });
+        const pet = spec[1] === 'pet' ? petFields(initial, part.fresh, refresh) : null;
+        let edit;
+        if (pet) row.append(el('strong', { class: 'dp-title' }, spec[0]), pet.node);
+        else if (spec[1] === 'flag') edit = el('input', { type: 'checkbox', checked: true });
+        else if (spec[1] === 'text') edit = area(initial);
         else if (spec[1] === 'rarity') {
           const opts = [
             ['unique', 'Unikatowy'],
@@ -5307,21 +5663,21 @@
             ['legendary', 'Legendarny']
           ];
           if (!opts.some(([value]) => value === initial)) opts.unshift([initial, initial || 'Pusta wartość']);
-          control = select(opts, initial);
+          edit = select(opts, initial);
         } else
-          control = input(
-            initial,
-            spec[1] === 'number' && /^-?\d+(\.\d+)?$/.test(initial) ? 'number' : 'text'
+          edit = input(initial, spec[1] === 'number' && /^-?\d+(\.\d+)?$/.test(initial) ? 'number' : 'text');
+        if (edit)
+          row.append(
+            field(
+              spec[0],
+              edit,
+              Object.hasOwn(tips, part.key) ? tips[part.key] : known ? 'Parametr: ' + part.key + '.' : ''
+            )
           );
-        const row = el(
-          'div',
-          { class: 'dp-card' },
-          field(spec[0], control, hints[part.key] || 'Parametr w stat: ' + part.key + '.')
-        );
         part.read = () => {
-          if (part.removed || (spec[1] === 'flag' && !control.checked)) return null;
+          if (part.removed || (spec[1] === 'flag' && !edit.checked)) return null;
           if (spec[1] === 'flag') return part.raw;
-          const value = control.value;
+          const value = pet ? pet.read() : edit.value;
           if (value === initial) return part.raw;
           if (value.includes(';'))
             error('Średnik rozdziela parametry. Usuń go z wartości pola „' + spec[0] + '”.');
@@ -5332,55 +5688,84 @@
           return part.raw.slice(0, part.eq + 1) + leading + value + (initial ? trailing : '');
         };
         removeRow(part, row, refresh);
-        control.addEventListener('input', refresh);
-        control.addEventListener('change', refresh);
+        if (edit) {
+          edit.addEventListener('input', refresh);
+          edit.addEventListener('change', refresh);
+        }
         rows.append(row);
-        return true;
       }
-      const unknown = parts.filter((part) => !addRow(part) && part.raw.trim());
+      parts.forEach(addRow);
+      search.addEventListener('input', () => {
+        const text = search.value.toLocaleLowerCase('pl');
+        for (const row of rows.children)
+          row.hidden = ![
+            row.dataset.statKey,
+            row.textContent,
+            ...all('input,textarea,select', row).map((edit) => edit.value)
+          ]
+            .join(' ')
+            .toLocaleLowerCase('pl')
+            .includes(text);
+      });
       const choice = select(
-        [...specs].map(([key, spec]) => [key, spec[0]]),
-        'opis'
+        [...defs].map(([key, spec]) => [key, spec[0]]).concat([['', 'Własny parametr']]),
+        defs.has('opis') ? 'opis' : ''
       );
+      const custom = input(),
+        flag = el('input', { type: 'checkbox' });
+      const customFields = el(
+        'div',
+        { class: 'dp-row' },
+        field('Nazwa parametru', custom),
+        field('Znacznik bez wartości', flag)
+      );
+      const toggle = () => {
+        customFields.hidden = choice.value !== '';
+      };
+      choice.addEventListener('change', toggle);
+      toggle();
       const add = button('Dodaj parametr', () => {
-        const key = choice.value,
-          spec = specs.get(key);
+        const key = choice.value || custom.value.trim(),
+          spec = defs.get(key) || [key, flag.checked ? 'flag' : 'line'];
+        if (!/^[a-zA-Z_][\w-]*$/.test(key)) {
+          note('Podaj nazwę parametru bez spacji, średnika i znaku równości.', 'error');
+          return;
+        }
         if ([...parts, ...extra].some((part) => part.key === key && !part.removed)) {
           note('Ten parametr już występuje. Zmień jego istniejące pole.');
           return;
         }
         const value = spec[1] === 'number' ? '0' : spec[1] === 'rarity' ? 'unique' : '';
         const part = statParts(key + (spec[1] === 'flag' ? '' : '=' + value))[0];
+        part.fresh = true;
         extra.push(part);
         addRow(part);
+        search.value = '';
+        for (const row of rows.children) row.hidden = false;
         refresh();
       });
       box.body.append(
         el(
           'p',
           { class: 'dp-help' },
-          'Zmieniasz tylko wybrane parametry. Inne wpisy i powtórzenia zostają zachowane.'
+          intro ||
+            'Zmieniasz wybrane wartości. Pozostałe wpisy i powtórzenia pozostają zachowane. Parametry bez definicji w pomocy strony są dostępne pod oryginalną nazwą.'
         ),
+        field('Znajdź parametr', search),
         rows,
-        el('div', { class: 'dp-row' }, field('Nowy parametr', choice), add)
+        el('div', { class: 'dp-row' }, field('Nowy parametr', choice), add),
+        customFields
       );
-      help(box, '#hideInfo1');
-      if (unknown.length)
-        box.body.append(
-          sourceView(
-            'Dodatkowe parametry zachowane bez zmian (' + unknown.length + ')',
-            unknown.map((part) => part.raw).join(';')
-          )
-        );
+      if (helpId) help(box, helpId);
       const view = sourceView('Podgląd zapisu', '');
       view.lastElementChild.replaceWith(preview);
       box.body.append(view, status);
       box.foot.append(
         button(
-          'Uzupełnij statystyki',
+          submit,
           () => {
             try {
-              apply(stat, source, statText(parts, extra), box);
+              apply(control, source, statText(parts, extra), box);
             } catch (e) {
               note(e.message, 'error');
             }
@@ -5805,9 +6190,11 @@
       );
     }
 
+    app.stats = statEditor;
+    if (!/(^|\/)items\//.test(app.path)) return;
     if (stat && check(stat))
       tools(stat, [
-        ['Edytuj statystyki w polach', statEditor],
+        ['Edytuj statystyki w polach', () => statEditor(stat)],
         ['Podgląd przedmiotu', previewItem]
       ]);
     if (eat && check(eat)) tools(eat, [['Ułóż działania po użyciu', actionEditor]]);
@@ -5968,7 +6355,7 @@
         if (control.multiple) status.append(el('span', { text: `Wybrano: ${options.length}` }));
         for (const option of options.slice(0, control.multiple ? 3 : 1)) {
           const record = records.get(option.value) || { id: option.value };
-          if (kind) status.append(picture(record, kind));
+          if (kind && kind !== 'player') status.append(picture(record, kind));
           status.append(el('span', { text: text(option.textContent) || record.name || `#${option.value}` }));
         }
         if (control.multiple && options.length > 3)
@@ -5977,7 +6364,7 @@
       control.addEventListener('input', update);
       control.addEventListener('change', update);
       update();
-      if (kind)
+      if (kind && kind !== 'player')
         app
           .list(kind)
           .then((values) => {
@@ -6066,7 +6453,8 @@
           row.disabled = entry.disabled;
           row.setAttribute('aria-pressed', String(values.has(entry.value)));
           if (values.has(entry.value)) row.classList.add('dp-primary');
-          if (kind && entry.value) row.append(picture(records.get(entry.value) || { id: entry.value }, kind));
+          if (kind && kind !== 'player' && entry.value)
+            row.append(picture(records.get(entry.value) || { id: entry.value }, kind));
           row.append(
             el(
               'span',
@@ -6096,7 +6484,7 @@
         dialog.foot.append(button('Wstaw wybór', () => apply(), 'dp-primary'));
       }
       draw();
-      if (kind)
+      if (kind && kind !== 'player')
         app
           .list(kind)
           .then((values) => {
@@ -6202,7 +6590,7 @@
       }
     }
 
-    function shop(control) {
+    function increment(control, event = 'shop') {
       if (!native(control)) return;
       const source = control.value;
       const rows = source
@@ -6213,13 +6601,17 @@
             return { ...rule, raw, base: { ...rule } };
           })
         : [];
-      const dialog = modal('Progress po zakupie');
+      const mob = event === 'mob';
+      const when = mob ? 'zabiciu' : 'zakupie';
+      const dialog = modal('Progress po ' + when);
       const area = el('div', { class: 'dp-stack' });
       const names = new Map();
       dialog.body.append(
         el('p', {
           class: 'dp-help',
-          text: 'Reguły zwiększają progress o 1 po zakupie tego przedmiotu, niezależnie od kupionej liczby sztuk. Warunek określa, kiedy zwiększyć progress; nie ogranicza dostępności oferty.'
+          text: mob
+            ? 'Reguły zwiększają progress o 1 po zabiciu tego potwora. Warunek określa obecną wartość wymaganą do zwiększenia progressu.'
+            : 'Reguły zwiększają progress o 1 po zakupie tego przedmiotu, niezależnie od kupionej liczby sztuk. Warunek określa, kiedy zwiększyć progress; nie ogranicza dostępności oferty.'
         }),
         area
       );
@@ -6242,7 +6634,7 @@
             );
             const mode = select(
               [
-                ['?', 'Po każdym zakupie'],
+                ['?', 'Po każdym ' + when],
                 ['=', 'Tylko przy dokładnej wartości']
               ],
               row.value === '?' ? '?' : '='
@@ -6262,7 +6654,7 @@
                   value.value = number;
                   row.value = number;
                 },
-                'To obecna wartość, przy której zakup ma zwiększyć progress o 1. Nie jest to wartość nadawana po zakupie.'
+                'To obecna wartość, przy której progress zwiększy się o 1 po ' + when + '.'
               )
             );
             const choose = button(
@@ -6326,7 +6718,12 @@
           area.append(card);
         }
         if (!rows.some((row) => !row.removed))
-          area.append(el('p', { class: 'dp-empty', text: 'Zakup nie zmieni żadnego progresu.' }));
+          area.append(
+            el('p', {
+              class: 'dp-empty',
+              text: (mob ? 'Zabicie potwora' : 'Zakup') + ' nie zmieni żadnego progresu.'
+            })
+          );
       };
       dialog.body.append(
         button('Dodaj regułę', () =>
@@ -6389,6 +6786,9 @@
         })
         .catch(() => {});
     }
+
+    app.increment = increment;
+    app.stage = chooseValue;
 
     function picker(control, spec) {
       if (!native(control)) return;
@@ -6733,7 +7133,7 @@
 
     const prog = q('#prog[name="prog"]', main);
     if (route('shop') && native(prog) && post(prog) && action(prog) === 'editshop') {
-      const bar = tools(prog, [['Ustaw progress po zakupie', () => shop(prog)]]);
+      const bar = tools(prog, [['Ustaw progress po zakupie', () => increment(prog)]]);
       if (bar)
         hint(
           prog,
@@ -6972,6 +7372,427 @@
         jump.value = '';
       });
       main.prepend(el('div', { class: 'dp-tools' }, jump));
+    }
+  }
+
+  function mobs(app) {
+    if (!/(^|\/)mobs\/(?:-?\d+|add)\/?$/.test(app.path)) return;
+    const { q, all, el, button, select, field, tools, set, modal, note, pick, check } = app;
+    const text = (value) =>
+      String(value || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const int = (value) => /^-?\d+$/.test(value) && Number.isSafeInteger(Number(value));
+    const native = (control) =>
+      control &&
+      (control.tagName === 'TEXTAREA' ||
+        (control.tagName === 'INPUT' && ['text', 'number'].includes(control.type))) &&
+      !app.root.contains(control);
+    const forms = all('form').filter(
+      (form) => form.method.toLowerCase() === 'post' && !form.closest('#backLogin')
+    );
+    const labels = forms
+      .flatMap((form) => all('label,b,strong', form))
+      .filter((label) => !label.closest('.dp-tools') && !app.root.contains(label));
+    const follows = (a, b) => !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+
+    function help(label) {
+      const node = label?.matches('[tip]') ? label : q('[tip]', label);
+      const tip = node?.getAttribute('tip') || '';
+      if (/^#[\w:-]+$/.test(tip)) return { selector: tip, text: text(q(tip)?.textContent) };
+      return {
+        selector: null,
+        text: tip ? text(new DOMParser().parseFromString(tip, 'text/html').body.textContent) : ''
+      };
+    }
+
+    function find(pattern) {
+      const label = labels.find((node) => pattern.test(text(node.textContent)));
+      if (!label) return {};
+      const form = label.closest('form');
+      const direct = label.control || (label.htmlFor && document.getElementById(label.htmlFor));
+      const next = labels.find(
+        (node) =>
+          node !== label && !label.contains(node) && node.closest('form') === form && follows(label, node)
+      );
+      const control =
+        native(direct) && direct.form === form
+          ? direct
+          : all('input,textarea', form).find(
+              (node) => native(node) && follows(label, node) && (!next || follows(node, next))
+            );
+      return { label, control, form };
+    }
+
+    function apply(control, source, value, box) {
+      if (!check(control)) return note('To pole nie jest teraz dostępne do edycji.', 'error');
+      if (control.value !== source) return note('Pole zmieniło się. Otwórz narzędzie ponownie.', 'error');
+      if (source !== value && set(control, value) === false) return;
+      box.close();
+    }
+
+    function item(value = '') {
+      const input = el('input', { class: 'dp-input', value, inputmode: 'numeric' });
+      const preview = el('div', { class: 'dp-row dp-help' });
+      const draw = (record) => {
+        preview.replaceChildren();
+        if (!input.value) return;
+        if (app.media)
+          preview.append(app.media.node(record || { id: input.value }, { kind: 'item', size: 40 }));
+        preview.append(el('span', { text: record?.name || `Szablon #${input.value}` }));
+      };
+      const choose = button('Wybierz przedmiot', () =>
+        pick(
+          'item',
+          (record) => {
+            input.value = String(record.id);
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            draw(record);
+          },
+          { value: input.value }
+        )
+      );
+      input.addEventListener('change', () => draw());
+      draw();
+      return {
+        input,
+        box: el('div', { class: 'dp-stack' }, field('Szablon przedmiotu', input), choose, preview)
+      };
+    }
+
+    function lootRows(group) {
+      const end = labels.find(
+        (label) =>
+          label !== group.label &&
+          label.closest('form') === group.form &&
+          follows(group.label, label) &&
+          /^(Progress po zabiciu|Statystyki|Dostęp do walki)\b/i.test(text(label.textContent))
+      );
+      const fields = all('input', group.form).filter(
+        (node) => native(node) && follows(group.label, node) && (!end || follows(node, end))
+      );
+      const rows = [];
+      for (let i = 0; i < fields.length - 2; i++) {
+        const [reward, weight, percent] = fields.slice(i, i + 3);
+        if (
+          !/^(text|number)$/.test(reward.type) ||
+          !/^(text|number)$/.test(weight.type) ||
+          (!percent.readOnly &&
+            !percent.disabled &&
+            (percent.placeholder.trim() !== '%' || percent.value.trim()))
+        )
+          continue;
+        if (!/%/.test(percent.value + percent.placeholder) || !check(reward) || !check(weight)) continue;
+        rows.push({ reward, weight, percent });
+        i += 2;
+      }
+      return rows;
+    }
+
+    function loot(group) {
+      const entries = lootRows(group);
+      if (!entries.length) return;
+      const box = modal('Łup potwora');
+      const rows = [];
+      const area = el('div', { class: 'dp-stat-grid' });
+      const refresh = () => {
+        const unknown = rows.some((row) =>
+          row.reward() ? !/^\d+$/.test(row.weight.value) : row.weight.value && row.weight.value !== '0'
+        );
+        const total = rows.reduce(
+          (sum, row) => sum + (row.reward() && /^\d+$/.test(row.weight.value) ? Number(row.weight.value) : 0),
+          0
+        );
+        for (const row of rows)
+          row.share.textContent = unknown
+            ? 'Nie obliczono udziału — sprawdź zapis wag.'
+            : total && row.reward()
+              ? `${((Number(row.weight.value) * 100) / total).toFixed(3)}% udziału w puli`
+              : 'Brak udziału w puli';
+      };
+      box.body.append(
+        el('p', {
+          class: 'dp-help',
+          text: 'Wybierz przedmiot i jego wagę w puli. Udział wynika ze stosunku wagi do sumy wag. Pusty wiersz służy do dodania pozycji w formularzu strony.'
+        })
+      );
+      const sourceHelp = help(group.label).text;
+      if (sourceHelp)
+        box.body.append(
+          el(
+            'details',
+            {},
+            el('summary', { text: 'Pomoc z formularza' }),
+            el('p', { class: 'dp-help', text: sourceHelp })
+          )
+        );
+      box.body.append(area);
+      for (const entry of entries) {
+        const source = entry.reward.value,
+          before = entry.weight.value;
+        const match = source.trim().match(/^#(\d+)(?:;(\d+))?$/);
+        const mode = select(
+          [
+            ['item', 'Przedmiot'],
+            ['raw', 'Inny zapis z formularza'],
+            ['empty', 'Puste miejsce']
+          ],
+          match ? 'item' : source ? 'raw' : 'empty'
+        );
+        const chosen = item(match?.[1] || '');
+        const amount = el('input', {
+          class: 'dp-input',
+          type: 'number',
+          min: '0',
+          step: '1',
+          value: match?.[2] || ''
+        });
+        const raw = el('input', { class: 'dp-input', value: source });
+        const weight = el('input', {
+          class: 'dp-input',
+          type: !before || /^\d+$/.test(before) ? 'number' : 'text',
+          min: '0',
+          step: '1',
+          value: before
+        });
+        const share = el('p', { class: 'dp-help' });
+        const amountField = field(
+          'Ilość przy łupie',
+          amount,
+          'Puste pole pozostawia zapis bez dopisanej ilości.'
+        );
+        const rawField = field('Zapis łupu', raw, 'Zachowaj format obsługiwany przez pomoc tego formularza.');
+        const row = {
+          entry,
+          source,
+          before,
+          weight,
+          share,
+          reward: () =>
+            mode.value === 'empty'
+              ? ''
+              : mode.value === 'raw'
+                ? raw.value
+                : '#' + chosen.input.value + (amount.value === '' ? '' : ';' + amount.value)
+        };
+        const initial = [mode.value, chosen.input.value, amount.value, raw.value];
+        row.read = () => {
+          if (
+            JSON.stringify(initial) ===
+            JSON.stringify([mode.value, chosen.input.value, amount.value, raw.value])
+          )
+            return source;
+          if (
+            mode.value === 'item' &&
+            (!/^\d+$/.test(chosen.input.value) ||
+              (amount.value !== '' && (!int(amount.value) || Number(amount.value) < 0)))
+          )
+            throw new Error('Wybierz szablon i poprawną ilość łupu.');
+          return row.reward();
+        };
+        rows.push(row);
+        const card = el(
+          'div',
+          { class: 'dp-card dp-stack' },
+          field(`Pozycja ${rows.length}`, mode),
+          chosen.box,
+          amountField,
+          rawField,
+          field('Waga w puli', weight),
+          share
+        );
+        const sync = () => {
+          chosen.box.hidden = amountField.hidden = mode.value !== 'item';
+          rawField.hidden = mode.value !== 'raw';
+          refresh();
+        };
+        mode.addEventListener('change', sync);
+        card.addEventListener('input', refresh);
+        area.append(card);
+        sync();
+      }
+      box.foot.append(
+        button('Anuluj', box.close),
+        button(
+          'Uzupełnij łup',
+          () => {
+            try {
+              const values = rows.map((row) => ({ row, reward: row.read(), weight: row.weight.value }));
+              for (const { row, reward, weight } of values) {
+                if (!check(row.entry.reward) || !check(row.entry.weight))
+                  throw new Error('Formularz nie jest teraz dostępny do edycji.');
+                if (row.entry.reward.value !== row.source || row.entry.weight.value !== row.before)
+                  throw new Error('Łup w formularzu zmienił się. Otwórz narzędzie ponownie.');
+                if (
+                  (reward !== row.source || weight !== row.before) &&
+                  reward &&
+                  (!int(weight) || Number(weight) < 0)
+                )
+                  throw new Error('Waga łupu musi być nieujemną liczbą całkowitą.');
+              }
+              for (const { row, reward, weight } of values) {
+                if (reward !== row.source && set(row.entry.reward, reward) === false) return;
+                if (weight !== row.before && set(row.entry.weight, weight) === false) return;
+              }
+              box.close();
+            } catch (error) {
+              note(error.message, 'error');
+            }
+          },
+          'dp-primary'
+        )
+      );
+      refresh();
+    }
+
+    function progress(control, label, required) {
+      if (!check(control)) return;
+      const source = control.value,
+        parsed = source.trim().match(/^(-?\d+)\s*=\s*(-?\d+)(\.\.)?$/);
+      const nativeHelp = help(label).text;
+      const minimum = required && /\.\./.test(control.placeholder + ' ' + nativeHelp + ' ' + source);
+      const modes = [
+        ['keep', 'Zachowaj obecny zapis'],
+        ['value', 'Progress i wartość'],
+        ...(minimum ? [['min', 'Progress od podanej wartości']] : []),
+        ['empty', 'Puste pole']
+      ];
+      const box = modal(
+        text(label.textContent)
+          .replace(/\[\?\]|:$/g, '')
+          .trim()
+      );
+      const mode = select(
+        modes,
+        parsed && (!parsed[3] || minimum) ? (parsed[3] ? 'min' : 'value') : source ? 'keep' : 'empty'
+      );
+      const id = el('input', { class: 'dp-input', value: parsed?.[1] || '', inputmode: 'numeric' });
+      const value = el('input', { class: 'dp-input', type: 'number', step: '1', value: parsed?.[2] || '' });
+      const initial = [mode.value, id.value, value.value];
+      const chosen = el('span', { class: 'dp-help' });
+      const controls = el(
+        'div',
+        { class: 'dp-stack' },
+        field('Numer progressu', id),
+        button('Wybierz progress', () =>
+          pick(
+            'progress',
+            (record) => {
+              id.value = String(record.id);
+              chosen.textContent = record.name || '';
+            },
+            { value: id.value, scope: 'player' }
+          )
+        ),
+        chosen,
+        field('Wartość w zapisie', value)
+      );
+      if (app.stage)
+        controls.append(
+          button('Wybierz wartość z etapów', () => {
+            if (!int(id.value)) return note('Wybierz najpierw progress.', 'error');
+            app.stage(
+              id.value,
+              value.value,
+              'player',
+              (number) => {
+                value.value = number;
+              },
+              nativeHelp
+            );
+          })
+        );
+      const sync = () => {
+        controls.hidden = !['value', 'min'].includes(mode.value);
+      };
+      mode.addEventListener('change', sync);
+      box.body.append(field('Sposób edycji', mode), controls);
+      if (nativeHelp) box.body.append(el('p', { class: 'dp-help', text: nativeHelp }));
+      if (source)
+        box.body.append(
+          el(
+            'details',
+            {},
+            el('summary', { text: 'Obecny zapis' }),
+            el('code', { class: 'dp-code', text: source })
+          )
+        );
+      box.foot.append(
+        button('Anuluj', box.close),
+        button(
+          'Uzupełnij pole',
+          () => {
+            let next = source;
+            if (JSON.stringify(initial) !== JSON.stringify([mode.value, id.value, value.value])) {
+              if (mode.value === 'empty') next = '';
+              if (['value', 'min'].includes(mode.value)) {
+                if (!int(id.value) || !int(value.value))
+                  return note('Podaj numer progressu i całkowitą wartość.', 'error');
+                next = `${id.value}=${value.value}${mode.value === 'min' ? '..' : ''}`;
+              }
+            }
+            apply(control, source, next, box);
+          },
+          'dp-primary'
+        )
+      );
+      sync();
+    }
+
+    const drop = find(/^Loot\b/i);
+    if (drop.label) {
+      const rows = lootRows(drop);
+      if (rows.length) tools(rows[0].reward, [['Edytuj łup', () => loot(drop)]]);
+    }
+    const after = find(/^Progress po zabiciu\b/i);
+    if (after.control && app.increment)
+      tools(after.control, [['Progress po zabiciu', () => app.increment(after.control, 'mob')]]);
+    const stats = find(/^Statystyki\b/i);
+    if (stats.control && app.stats)
+      tools(stats.control, [
+        [
+          'Edytuj statystyki potwora',
+          () => {
+            const tip = help(stats.label);
+            app.stats(stats.control, {
+              title: 'Statystyki potwora',
+              specs: new Map(),
+              hints: {},
+              help: tip.selector,
+              intro: tip.selector
+                ? 'Edytuj wartości parametrów potwora.'
+                : tip.text || 'Edytuj wartości parametrów potwora.'
+            });
+          }
+        ]
+      ]);
+    const needed = find(/^Wymagany przedmiot\b/i);
+    if (needed.control)
+      tools(needed.control, [
+        [
+          'Wybierz wymagany przedmiot',
+          () => {
+            if (!check(needed.control)) return;
+            const before = needed.control.value;
+            pick(
+              'item',
+              (record) => {
+                if (needed.control.value !== before)
+                  return note('Wymagany przedmiot zmienił się. Otwórz wybór ponownie.', 'error');
+                set(needed.control, record.id);
+              },
+              { value: before }
+            );
+          }
+        ]
+      ]);
+    for (const [pattern, required] of [
+      [/^Wymagany postęp\b/i, true],
+      [/^Postęp za przegran/i, false]
+    ]) {
+      const entry = find(pattern);
+      if (entry.control)
+        tools(entry.control, [['Ustaw progress', () => progress(entry.control, entry.label, required)]]);
     }
   }
 

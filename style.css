@@ -231,7 +231,8 @@ a.dp-primary:hover {
 .dp-tools {
   margin: 8px 0;
 }
-.dp-grid {
+.dp-grid,
+.dp-stat-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
@@ -252,6 +253,20 @@ a.dp-primary:hover {
 }
 .dp-card .dp-card {
   background: var(--dp-bg);
+}
+.dp-stat-row {
+  min-width: 0;
+  margin: 0;
+  align-self: start;
+}
+.dp-stat-row > .dp-btn {
+  margin-top: 10px;
+}
+.dp-stat-image {
+  max-width: 96px;
+  max-height: 96px;
+  object-fit: contain;
+  image-rendering: pixelated;
 }
 .dp-title {
   margin: 0 0 10px;
@@ -578,6 +593,7 @@ a.dp-item[aria-current='true'] small {
 
 @media (max-width: 620px) {
   .dp-grid,
+  .dp-stat-grid,
   .dp-catalog {
     grid-template-columns: minmax(0, 1fr);
   }

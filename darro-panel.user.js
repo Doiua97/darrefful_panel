@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Darro Panel
 // @namespace    darro-panel
-// @version      0.3.0
-// @description  Wygodna edycja dialogów, progressów, przedmiotów i formularzy.
+// @version      0.4.0
+// @description  Wygodna edycja dialogów, progressów, przedmiotów i formularzy Darro.
 // @match        https://addons.darro.eu/*
 // @run-at       document-end
 // @noframes
