@@ -508,6 +508,7 @@ button.dp-item[aria-pressed='true'] small {
   overflow-wrap: anywhere;
 }
 .dp-toast {
+  pointer-events: none;
   position: fixed;
   z-index: 2147483000;
   left: 50%;
@@ -579,4 +580,64 @@ button.dp-item[aria-pressed='true'] small {
   .dp-btn {
     transition: none;
   }
+}
+
+.dp-media {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--dp-soft);
+}
+
+.dp-media-frame {
+  display: block;
+  overflow: hidden;
+  flex: none;
+}
+
+.dp-media .dp-media-img {
+  display: block;
+  flex: none;
+  object-fit: initial;
+  image-rendering: pixelated;
+}
+
+.dp-media-empty {
+  padding: 4px;
+  font-size: 10px;
+  line-height: 1.2;
+  text-align: center;
+  color: var(--dp-muted);
+}
+
+.dp-dialog-step {
+  scroll-margin: 16px;
+}
+
+.dp-dialog-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0;
+  margin: 12px 0;
+  list-style: none;
+}
+
+.dp-dialog-facts li {
+  padding: 10px 12px;
+  border-left: 3px solid var(--dp-accent);
+  border-radius: 0 6px 6px 0;
+  background: var(--dp-bg);
+  overflow-wrap: anywhere;
+}
+
+.dp-dialog-facts .dp-btn {
+  margin: 5px 0 0 8px;
+}
+
+.dp-dialog-uses {
+  margin-bottom: 16px;
 }

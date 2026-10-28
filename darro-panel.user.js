@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Darro Panel
 // @namespace    darro-panel
-// @version      0.1.0
-// @description  Wygodna edycja dialogów, progressów, przedmiotów i formularzy w na stronie dodatku globalnego Darrefulla.
+// @version      0.2.0
+// @description  Wygodna edycja dialogów, progressów, przedmiotów i formularzy.
 // @match        https://addons.darro.eu/*
 // @run-at       document-end
 // @noframes
@@ -77,35 +77,19 @@
   }
 
   function message(text, setup = false) {
-    let node = document.getElementById('dp-loader');
-    if (node) node.remove();
-    node = document.createElement('div');
-    node.id = 'dp-loader';
-    node.setAttribute('role', 'status');
-    Object.assign(node.style, {
-      position: 'fixed',
-      right: '18px',
-      bottom: '18px',
-      zIndex: '2147483000',
-      maxWidth: '360px',
-      padding: '16px',
-      border: '1px solid #dce3ed',
-      borderRadius: '12px',
-      background: '#fff',
-      color: '#243044',
-      boxShadow: '0 12px 36px #0002',
-      font: '14px/1.5 system-ui'
-    });
-    const label = document.createElement('div');
-    label.textContent = text;
-    node.append(label);
+    document.getElementById('dp-loader')?.remove();
     const button = document.createElement('button');
+    button.id = 'dp-loader';
     button.type = 'button';
-    button.textContent = setup ? 'Ustaw źródło plików' : 'Zamknij';
-    Object.assign(button.style, { marginTop: '10px', padding: '7px 12px', cursor: 'pointer' });
-    button.addEventListener('click', setup ? configure : () => node.remove());
-    node.append(button);
-    document.body.append(node);
+    button.textContent =
+      'Darro Panel: ' + text + (setup ? ' Kliknij, aby ustawić źródło.' : ' Kliknij, aby zamknąć.');
+    button.style.cssText = [
+      'position:fixed;right:18px;bottom:18px;z-index:2147483000;max-width:360px',
+      'padding:16px;border:1px solid #dce3ed;border-radius:10px;background:#fff;color:#243044',
+      'font:14px/1.5 system-ui;text-align:left;cursor:pointer;box-shadow:0 12px 36px #0002'
+    ].join(';');
+    button.addEventListener('click', setup ? configure : () => button.remove());
+    document.body.append(button);
   }
 
   function read(url) {

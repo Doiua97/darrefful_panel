@@ -45,6 +45,7 @@
     const stack = [];
     const cache = new Map();
     const pending = new Map();
+    const sources = new WeakMap();
     const stageCache = new Map();
     let serial = 0;
     let draftTimer;
@@ -126,13 +127,22 @@
     }
 
     function check(node) {
+      if (
+        !node ||
+        !node.isConnected ||
+        node.disabled ||
+        node.readOnly ||
+        node.closest('fieldset[disabled]') ||
+        !context()
+      )
+        return false;
+      const form = node.form;
+      const submits =
+        form?.method.toLowerCase() === 'post'
+          ? all('button:not([type]), button[type="submit"], input[type="submit"]', form)
+          : [];
       return (
-        !!node &&
-        node.isConnected &&
-        !node.disabled &&
-        !node.readOnly &&
-        !node.closest('fieldset[disabled]') &&
-        context()
+        !submits.length || submits.some((button) => !button.disabled && !button.closest('fieldset[disabled]'))
       );
     }
 
@@ -251,7 +261,7 @@
       });
       stack.push(shade);
       root.append(shade);
-      setTimeout(() => q('input, select, textarea, button', body)?.focus() || q('button', head)?.focus(), 0);
+      setTimeout(() => (q('input, select, textarea, button', body) || q('button', head))?.focus(), 0);
       return { box, body, foot, close };
     }
 
@@ -317,6 +327,7 @@
         const user = q('.navbar-right .dropdown-toggle b', doc)?.textContent.trim();
         if (!user || user !== account)
           throw new Error('Sesja wygasła albo zmieniło się konto. Odśwież stronę.');
+        sources.set(doc, final.href);
         return doc;
       } finally {
         clearTimeout(timer);
@@ -340,12 +351,51 @@
       store.set('aliases', entries);
     }
 
-    function read(doc, kind) {
+    function refs(doc, scope) {
+      const ids = new Set();
+      const text = all('textarea[name="talk"], textarea[name="npc_d"]', doc)
+        .map((node) => node.value)
+        .join('\n');
+      const patterns =
+        scope === 'global'
+          ? [
+              /#(?:IFGPROGRESS|GPROGRESS)\s+(-?\d+)\b/g,
+              /\bGPROGRESS(?:_LAST_UPDATE)?:(-?\d+)\b/g,
+              /\[(?:PGVAL|GPROGRESS):(-?\d+)\b/g
+            ]
+          : [
+              /#(?:IFPROGRESS|PROGRESS|IFTIME|RESET_PROGRESS_LAST_DAY|RANKING)\s+(-?\d+)\b/g,
+              /\bPROGRESS(?:_LAST_UPDATE)?:(-?\d+)\b/g,
+              /\[(?:PVAL|PROGRESS):(-?\d+)\b/g
+            ];
+      patterns.forEach((pattern) => {
+        for (const match of text.matchAll(pattern)) ids.add(match[1]);
+      });
+      all('input[name="prog"]', doc).forEach((node) =>
+        node.value.split(',').forEach((part) => {
+          const match = part.match(/^\s*(-?\d+)\s*=\s*(?:\?|-?\d+)(?:\s*=\s*(G))?\s*$/);
+          if (match && (match[2] ? 'global' : 'player') === scope) ids.add(match[1]);
+        })
+      );
+      if (scope === 'player')
+        all('input[name="mark"]', doc).forEach((node) => {
+          for (const match of node.value.matchAll(/(?:^|,)\s*(-?\d+)\s*=/g)) ids.add(match[1]);
+        });
+      const route = new URL(sources.get(doc) || location.href).pathname;
+      const current = route.match(/\/progress\/(-?\d+)/);
+      const global = all('form', doc).some(
+        (form) => q('input[name="aid"]', form)?.value === '1' && q('input[name="progress_set"]', form)
+      );
+      if (current && (scope === 'player' || global)) ids.add(current[1]);
+      return Array.from(ids, (id) => ({ id, name: 'Progress #' + id, scope, origin: 'odwołanie' }));
+    }
+
+    function read(doc, kind, scope = 'player') {
       const records = new Map();
       const add = (record) => {
         if (!record || record.id === undefined || !/^-?\d+(?:,\d+)?$/.test(String(record.id))) return;
         const id = String(record.id);
-        if (id === '-1' || (kind === 'item' && id === '0')) return;
+        if ((id === '-1' && kind !== 'progress') || (kind === 'item' && id === '0')) return;
         records.set(id, {
           ...records.get(id),
           ...record,
@@ -359,7 +409,7 @@
         item: 'select[name="template"] option, select[name="tid"] option',
         player: 'select[name="aids[]"] option, select[name="players[]"] option',
         quest: 'datalist#quest_list option',
-        progress: 'datalist#quest_list option'
+        progress: scope === 'player' ? 'datalist#quest_list option' : ''
       };
       if (selectors[kind])
         all(selectors[kind], doc).forEach((option) => {
@@ -375,7 +425,13 @@
               .map((row) => row.textContent.trim());
             label = [option.parentElement.label, ...names].filter(Boolean).join(' · ') || label;
           }
-          add({ id, name: label, origin: 'panel', group: option.parentElement?.label || '' });
+          add({
+            id,
+            name: label,
+            origin: ['quest', 'progress'].includes(kind) ? 'Questlog' : 'panel',
+            group: option.parentElement?.label || '',
+            quest: ['quest', 'progress'].includes(kind)
+          });
         });
       if (kind === 'item')
         all('[tip]', doc).forEach((node) => {
@@ -404,7 +460,7 @@
         item: /\/items\/template\/(-?\d+)(?:\/|$)/,
         player: /\/player\/(-?\d+)(?:\/|$)/,
         quest: /\/quest,(-?\d+)(?:\/|$)/,
-        progress: /\/(?:quest,|progress\/)(-?\d+)(?:\/|$)/
+        progress: scope === 'player' ? /\/(?:quest,|progress\/)(-?\d+)(?:\/|$)/ : null
       };
       if (patterns[kind])
         all('a[href]', doc).forEach((link) => {
@@ -417,28 +473,22 @@
             if (own && decodeURIComponent(own[1]).toLowerCase() !== world.toLowerCase()) return;
             const match = href.pathname.match(patterns[kind]);
             if (!match || Number(match[1]) <= 0) return;
+            if (['quest', 'progress'].includes(kind) && (href.search || href.hash)) return;
             const old = records.get(match[1]);
             const text = link.textContent.replace(/^\[?\s*#?\d+\]?\s*[-—]?\s*|\s*#\d+$/g, '').trim();
-            if (!old) add({ id: match[1], name: text || '#' + match[1], origin: 'powiązanie' });
+            const quest = /\/quest,-?\d+\/?$/.test(href.pathname);
+            if (!old || /^#|^Progress #/.test(old.name))
+              add({
+                id: match[1],
+                name: text || '#' + match[1],
+                origin: quest ? 'Questlog' : 'powiązanie',
+                quest
+              });
           } catch {}
         });
       if (kind === 'progress') {
-        const texts = all(
-          'textarea[name="talk"], textarea[name="npc_d"], input[name="prog"], input[name="mark"]',
-          doc
-        )
-          .map((node) => node.value)
-          .join('\n');
-        const patterns = [
-          /#(?:IFG?PROGRESS|G?PROGRESS|IFTIME|RESET_PROGRESS_LAST_DAY|RANKING)\s+(-?\d+)\b/g,
-          /\bG?PROGRESS(?:_LAST_UPDATE)?:([-\d]+)/g,
-          /\[(?:PVAL|PGVAL|PROGRESS|GPROGRESS):(-?\d+)/g,
-          /(?:^|,)\s*(-?\d+)=(?:\?|[-\d!])/gm
-        ];
-        patterns.forEach((pattern) => {
-          for (const match of texts.matchAll(pattern))
-            if (!records.has(match[1]))
-              add({ id: match[1], name: 'Progress #' + match[1], origin: 'odwołanie' });
+        refs(doc, scope).forEach((record) => {
+          if (!records.has(record.id)) add(record);
         });
       }
       if (kind === 'map') {
@@ -446,7 +496,12 @@
         const name = q('[name="map_name"]', doc)?.value;
         if (id) add({ id, name: name || '#' + id, origin: 'formularz' });
       }
-      return Array.from(records.values());
+      const entries = Array.from(records.values());
+      if (!['progress', 'quest'].includes(kind)) {
+        app.media.collect(doc, kind, sources.get(doc) || location.href);
+        return app.media.enrich(entries, kind);
+      }
+      return entries.map((record) => ({ ...record, scope }));
     }
 
     function merge(...sets) {
@@ -462,50 +517,63 @@
       return Array.from(out.values());
     }
 
-    async function list(kind) {
+    async function list(kind, options = {}) {
       if (!context()) throw new Error('Zmieniono konto lub świat. Odśwież stronę.');
-      if (cache.has(kind)) return merge(read(document, kind), cache.get(kind));
-      if (pending.has(kind)) return pending.get(kind);
+      const scope = options.scope === 'global' ? 'global' : 'player';
+      const key = kind === 'progress' ? kind + ':' + scope : kind;
+      if (cache.has(key)) return merge(read(document, kind, scope), cache.get(key));
+      if (pending.has(key)) return pending.get(key);
       const job = (async () => {
-        let entries = read(document, kind);
-        if (kind !== 'player') {
+        let entries = read(document, kind, scope);
+        if (!['player', 'progress'].includes(kind)) {
           try {
             const query = new URLSearchParams({ t: 'entity_list', kind, world, token: String(acc().token) });
             const data = await request('/ajax.php?' + query, true);
             if (Array.isArray(data))
               entries = merge(
                 entries,
-                data
-                  .filter((row) => row && /^-?\d+$/.test(String(row.id)))
+                app.media
+                  .enrich(
+                    data.filter((row) => row && /^-?\d+$/.test(String(row.id))),
+                    kind
+                  )
                   .map((row) => ({
                     id: String(row.id),
                     name: clean(row.name || '#' + row.id),
-                    origin: 'panel'
+                    src: row.src,
+                    frame: row.frame,
+                    origin: kind === 'quest' ? 'Questlog' : 'panel',
+                    quest: kind === 'quest'
                   }))
               );
           } catch {}
         }
-        const sources = {
-          item: 'items/template',
-          quest: 'quest',
-          progress: 'quest',
-          npc: 'npc',
-          shop: 'shop'
-        };
-        if (sources[kind] && (kind === 'item' || !entries.length || kind === 'progress')) {
+        const routes = { item: 'items/template', quest: 'quest', npc: 'npc', shop: 'shop' };
+        if (kind === 'progress' && scope === 'player') {
           try {
-            entries = merge(entries, read(await request(url(sources[kind])), kind));
+            entries = merge(entries, read(await request(url('progress')), kind, scope));
+          } catch {}
+          try {
+            entries = merge(
+              entries,
+              (await list('quest')).map((record) => ({ ...record, scope, quest: true, origin: 'Questlog' }))
+            );
+          } catch {}
+        } else if (routes[kind] && (['item', 'npc', 'quest'].includes(kind) || !entries.length)) {
+          try {
+            entries = merge(entries, read(await request(url(routes[kind])), kind, scope));
           } catch {}
         }
         if (!context()) throw new Error('Zmieniono konto lub świat. Odśwież stronę.');
-        cache.set(kind, entries);
+        entries = app.media.enrich(entries, kind);
+        cache.set(key, entries);
         return entries;
       })();
-      pending.set(kind, job);
+      pending.set(key, job);
       try {
         return await job;
       } finally {
-        pending.delete(kind);
+        pending.delete(key);
       }
     }
 
@@ -567,7 +635,7 @@
       const old = aliases()[scope + ':' + record.id] || {};
       const name = el('input', {
         class: 'dp-input',
-        value: old.name || (scope === 'player' && !record.name.startsWith('Progress #') ? record.name : ''),
+        value: old.name || (scope === 'player' && record.quest ? record.name : ''),
         maxlength: 120
       });
       const type = select(
@@ -583,7 +651,11 @@
       box.body.append(
         el('p', {
           class: 'dp-help',
-          text: (scope === 'global' ? 'Wspólny dla świata' : 'Progress gracza') + ' · ' + world
+          text:
+            (scope === 'global' ? 'Wspólny dla świata' : 'Progress gracza') +
+            ' · ' +
+            world +
+            '. To lokalny opis numeru. Nie tworzy zmiennej, nie rezerwuje ID i nie ustawia jej wartości.'
         }),
         field('Nazwa w dodatku', name),
         field('Przeznaczenie', type),
@@ -624,6 +696,16 @@
         render();
       });
       const scope = options.scope === 'global' ? 'global' : 'player';
+      if (kind === 'progress')
+        box.body.append(
+          el('p', {
+            class: 'dp-help',
+            text:
+              scope === 'global'
+                ? 'Wybierasz numer wspólnej zmiennej świata. Lista zawiera rozpoznane odwołania globalne z tego ekranu i Twoje opisy. Quest o tym samym ID nie określa jej nazwy ani etapów.'
+                : 'Wybierasz numer zmiennej gracza. Lista łączy dostępne questy, pozycje z panelu Progressy i odwołania z tego ekranu. Nazwany etap opisuje wartość; nie jest numerem kroku rozmowy.'
+          })
+        );
       box.body.append(
         el('div', { class: 'dp-grid' }, field('Nazwa lub ID', search), field('Grupa', group)),
         el('label', { class: 'dp-check' }, fav, 'Tylko ulubione'),
@@ -631,6 +713,13 @@
         grid,
         more
       );
+      if (kind === 'progress')
+        box.body.append(
+          el('p', {
+            class: 'dp-help',
+            text: 'To znane numery, nie pełny rejestr świata ani bieżące wartości kont. Brak numeru na liście nie oznacza, że jest wolny.'
+          })
+        );
       let entries = [];
       let limit = 80;
       const favorite = (id) => store.get('favorites', []).includes(kind + ':' + scope + ':' + id);
@@ -644,7 +733,13 @@
               : extra?.name && kind === 'progress'
                 ? extra.name
                 : record.name;
-          return { ...record, name, scope, note: kind === 'progress' ? extra?.note || '' : '' };
+          return {
+            ...record,
+            name,
+            scope,
+            note: kind === 'progress' ? extra?.note || '' : '',
+            origin: kind === 'progress' && extra?.name ? record.origin + ' + własny opis' : record.origin
+          };
         });
         if (kind === 'progress')
           Object.entries(meta).forEach(([key, data]) => {
@@ -689,15 +784,19 @@
           const info = el('span', {
             class: 'dp-help',
             text:
-              '#' + record.id + (record.page ? ' · ' + record.page : record.group ? ' · ' + record.group : '')
+              '#' +
+              record.id +
+              (kind === 'progress'
+                ? ' · ' + record.origin
+                : record.page
+                  ? ' · ' + record.page
+                  : record.group
+                    ? ' · ' + record.group
+                    : '')
           });
-          const img = record.src
-            ? el('img', { src: record.src, alt: '', loading: 'lazy', referrerpolicy: 'no-referrer' })
-            : el('span', {
-                class: 'dp-item-symbol',
-                text: kind === 'progress' ? '#' : kind === 'item' ? '◇' : '•',
-                'aria-hidden': 'true'
-              });
+          const img = ['progress', 'quest'].includes(kind)
+            ? el('span', { class: 'dp-item-symbol', text: '#', 'aria-hidden': 'true' })
+            : app.media.node(record);
           const use = button(
             '',
             () => {
@@ -770,7 +869,15 @@
             inputmode: 'numeric',
             value: String(options.value || '')
           });
-          form.body.append(field('ID', id, 'Użyj tej opcji, gdy obiektu nie ma we wczytanej liście.'));
+          form.body.append(
+            field(
+              'ID',
+              id,
+              kind === 'progress'
+                ? 'Podaj numer ze swojego planu lub kodu. Ten wybór nie sprawdza, czy numer jest wolny, i nie tworzy wartości dla graczy.'
+                : 'Użyj tej opcji, gdy znasz ID obiektu. Dostępność i zgodność sprawdza formularz Darro.'
+            )
+          );
           form.foot.append(
             button(
               'Wybierz',
@@ -791,7 +898,7 @@
         })
       );
       try {
-        entries = await list(kind);
+        entries = await list(kind, { scope });
       } catch (error) {
         state.textContent = error.message;
         return;
@@ -813,27 +920,76 @@
         })
       );
       const buttons = el('div', { class: 'dp-grid' });
-      Object.entries(labels).forEach(([kind, label]) =>
+      const entries = Object.entries(labels)
+        .filter(([kind]) => kind !== 'progress')
+        .map(([kind, label]) => ({ kind, label, scope: 'player' }));
+      entries.unshift({ kind: 'progress', label: 'Progressy globalne', scope: 'global' });
+      entries.unshift({ kind: 'progress', label: 'Progressy gracza', scope: 'player' });
+      entries.forEach(({ kind, label, scope }) =>
         buttons.append(
           button(label, () =>
-            pick(kind, (record) => {
-              const detail = modal(record.name);
-              detail.body.append(
-                el('p', { class: 'dp-help', text: label + ' · #' + record.id + ' · ' + world })
-              );
-              if (record.src)
-                detail.body.append(el('img', { class: 'dp-big-icon', src: record.src, alt: record.name }));
-              if (kind === 'progress')
-                detail.body.append(button('Edytuj opis', () => editAlias(record, 'player')));
-              if (routes[kind])
-                detail.foot.append(
-                  el('a', {
-                    class: 'dp-btn dp-primary',
-                    href: url(routes[kind] + encodeURIComponent(record.id)),
-                    text: 'Otwórz w panelu'
-                  })
+            pick(
+              kind,
+              (record) => {
+                const detail = modal(record.name);
+                detail.body.append(
+                  el('p', { class: 'dp-help', text: label + ' · #' + record.id + ' · ' + world })
                 );
-            })
+                if (!['progress', 'quest'].includes(kind))
+                  detail.body.append(app.media.node(record, { size: 96 }));
+                if (kind === 'progress') {
+                  detail.body.append(
+                    el('p', {
+                      class: 'dp-help',
+                      text:
+                        scope === 'global'
+                          ? 'Jedna wartość wspólna dla świata. W panelu wartości globalne są przypisane do systemowego konta AID 1.'
+                          : 'Każde konto ma własną wartość. Bieżący stan sprawdzisz w natywnym panelu Progressy.'
+                    }),
+                    button('Edytuj własny opis', () => editAlias(record, scope))
+                  );
+                  if (record.quest && scope === 'player')
+                    stages(record.id).then((rows) => {
+                      if (!detail.box.isConnected) return;
+                      detail.body.append(
+                        el('h3', { class: 'dp-title', text: 'Opisy wartości w Questlogu' }),
+                        el('p', {
+                          class: 'dp-help',
+                          text: 'To definicja zadania. Nie jest stanem konkretnego konta.'
+                        })
+                      );
+                      if (rows.length)
+                        detail.body.append(
+                          el(
+                            'div',
+                            { class: 'dp-stack' },
+                            rows.map((row) =>
+                              el(
+                                'div',
+                                { class: 'dp-card' },
+                                el('strong', { text: row.value }),
+                                el('p', { text: row.label })
+                              )
+                            )
+                          )
+                        );
+                      else
+                        detail.body.append(
+                          el('p', { class: 'dp-help', text: 'Brak dostępnych opisów etapów.' })
+                        );
+                    });
+                }
+                if (routes[kind])
+                  detail.foot.append(
+                    el('a', {
+                      class: 'dp-btn dp-primary',
+                      href: url(routes[kind] + encodeURIComponent(record.id)),
+                      text: kind === 'progress' ? 'Otwórz wartości w panelu' : 'Otwórz w panelu'
+                    })
+                  );
+              },
+              { scope, title: label }
+            )
           )
         )
       );
@@ -1089,7 +1245,7 @@
           }),
           button('Ustawienia', settings)
         ),
-        el('small', { class: 'dp-help', text: '0.1.0 · Alt+Shift+D · zmiany zapisujesz w panelu' })
+        el('small', { class: 'dp-help', text: '0.2.0 · Alt+Shift+D · zmiany zapisujesz w panelu' })
       );
       dock.append(panel, toggle);
       root.append(dock);
@@ -1126,6 +1282,7 @@
       store,
       check
     };
+    app.media = media(app);
     document.documentElement.dataset.dpTheme = store.get('theme', 'auto');
     shell();
     [dialogs, items, panels].forEach((install) => {
@@ -1149,6 +1306,264 @@
       saveDraft();
     });
     if (bridge.test) bridge.app = app;
+  }
+
+  function media(app) {
+    const { q, all, el } = app;
+    const saved = new Map();
+    const paths = {
+      npc: /\/npc\/(\d+)(?:\/|$)/,
+      mob: /\/mobs\/(\d+)(?:\/|$)/,
+      map: /\/maps\/(\d+)(?:\/|$)/,
+      item: /\/items\/template\/(\d+)(?:\/|$)/,
+      shop: /\/shop\/(\d+)(?:\/|$)/,
+      player: /\/player\/(\d+)(?:\/|$)/
+    };
+    const positive = (value) =>
+      Number.isFinite(Number(value)) && Number(value) > 0 && Number(value) <= 32768 ? Number(value) : 0;
+    const offset = (value) =>
+      Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 32768 ? Number(value) || 0 : 0;
+
+    function url(value, base = location.href) {
+      if (typeof value !== 'string' || !value.trim() || /^\d+$/.test(value.trim())) return '';
+      try {
+        const target = new URL(value.trim(), base);
+        return /^https?:$/.test(target.protocol) && !target.username && !target.password ? target.href : '';
+      } catch {
+        return '';
+      }
+    }
+
+    function frame(data, src) {
+      const raw = data.frame && typeof data.frame === 'object' ? data.frame : {};
+      const width = positive(raw.width || data.fw || data.img_width);
+      const height = positive(raw.height || data.fh || data.img_height);
+      if (width && height) return { width, height, x: offset(raw.x), y: offset(raw.y) };
+      const cols = positive(raw.cols);
+      const rows = positive(raw.rows);
+      if (cols && rows && Number.isInteger(cols) && Number.isInteger(rows) && cols <= 64 && rows <= 64)
+        return { cols, rows, x: offset(raw.x), y: offset(raw.y) };
+      if (/\/postacie\//i.test(new URL(src).pathname)) return { cols: 4, rows: 4, x: 0, y: 0 };
+      return null;
+    }
+
+    function visual(data, kind, base) {
+      if (!data || typeof data !== 'object') return null;
+      const sources = [data.src, data.img_src, data.icon, data.img, data.image];
+      if (kind === 'map') sources.push(data.nimg, data.file);
+      if (kind === 'player') sources.push(data.avatar, data.outfit);
+      const src = sources.map((value) => url(value, base)).find(Boolean);
+      if (!src) return null;
+      return { src, frame: frame(data, src) };
+    }
+
+    function remember(id, data, kind) {
+      if (!data || !/^\d+$/.test(String(id)) || Number(id) <= 0) return;
+      const key = kind + ':' + id;
+      const old = saved.get(key);
+      if (!data.frame && old?.src === data.src && old.frame) data = { ...data, frame: old.frame };
+      saved.set(key, data);
+      return { id: String(id), ...data };
+    }
+
+    function linkId(link, kind, base) {
+      const raw = link.getAttribute('href') || '';
+      if (!raw || raw.endsWith('#') || link.matches('[data-toggle="dropdown"]')) return '';
+      try {
+        const target = new URL(raw, base);
+        if (target.origin !== location.origin) return '';
+        const world = target.pathname.match(/^\/world:([^/]+)/);
+        if (world && decodeURIComponent(world[1]).toLowerCase() !== app.world.toLowerCase()) return '';
+        return target.pathname.match(paths[kind])?.[1] || '';
+      } catch {
+        return '';
+      }
+    }
+
+    function tip(node, kind, base) {
+      const raw = node.getAttribute('tip');
+      if (!raw) return null;
+      try {
+        const data = JSON.parse(raw);
+        if (kind === 'item' && data?.template !== undefined) return null;
+        return visual(data, kind, base);
+      } catch {}
+      const parsed = document.createElement('template');
+      parsed.innerHTML = raw;
+      const image = q('img[src]', parsed.content);
+      return image ? visual({ src: image.getAttribute('src') }, kind, base) : null;
+    }
+
+    function background(node, kind, base) {
+      const match = node.style?.backgroundImage.match(/^url\(["']?(.*?)["']?\)$/);
+      if (!match) return null;
+      const data = { src: match[1] };
+      if (kind === 'npc' || kind === 'mob' || kind === 'player') {
+        const width = positive(node.style.width.replace(/px$/, ''));
+        const height = positive(node.style.height.replace(/px$/, ''));
+        const position = (node.style.backgroundPosition || '0px 0px').split(/\s+/);
+        const x = /^-?\d+(?:\.\d+)?(?:px)?$/.test(position[0]) ? Number(position[0].replace(/px$/, '')) : NaN;
+        const y = /^-?\d+(?:\.\d+)?(?:px)?$/.test(position[1] || '0')
+          ? Number((position[1] || '0').replace(/px$/, ''))
+          : NaN;
+        if (width && height && x <= 0 && y <= 0) data.frame = { width, height, x: -x, y: -y };
+      }
+      return visual(data, kind, base);
+    }
+
+    function picture(node, kind, base) {
+      if (kind === 'item' && node.hasAttribute('tip')) {
+        try {
+          if (JSON.parse(node.getAttribute('tip'))?.template !== undefined) return null;
+        } catch {}
+      }
+      const data = tip(node, kind, base);
+      if (data) return data;
+      if (node.tagName === 'IMG') return visual({ src: node.getAttribute('src') }, kind, base);
+      return background(node, kind, base);
+    }
+
+    function collect(doc, kind, base = doc.baseURI || location.href) {
+      const out = new Map();
+      if (!paths[kind]) return [];
+      const add = (id, data) => {
+        const row = remember(id, data, kind);
+        if (row) out.set(row.id, row);
+      };
+      if (kind === 'item')
+        all('[tip]', doc).forEach((node) => {
+          try {
+            const data = JSON.parse(node.getAttribute('tip'));
+            if (data?.template === undefined) add(data?.id, visual(data, kind, base));
+          } catch {}
+        });
+      all('a[href]', doc).forEach((link) => {
+        if (app.root?.contains(link)) return;
+        const id = linkId(link, kind, base);
+        if (!id) return;
+        let data = picture(link, kind, base);
+        const image = q('img[src]', link);
+        if (!data && image) data = picture(image, kind, base);
+        if (!data) {
+          const row = link.closest('li, tr');
+          if (row) {
+            const ids = new Set();
+            all('a[href]', row).forEach((other) =>
+              Object.keys(paths).forEach((type) => {
+                const otherId = linkId(other, type, base);
+                if (otherId) ids.add(type + ':' + otherId);
+              })
+            );
+            const images = all('img[src]', row);
+            if (ids.size === 1 && images.length === 1) data = picture(images[0], kind, base);
+          }
+        }
+        add(id, data);
+      });
+      let id;
+      try {
+        id = new URL(base, location.href).pathname.match(paths[kind])?.[1];
+      } catch {}
+      if (id && (kind === 'npc' || kind === 'mob')) {
+        const input = q('[name="img_src"]', doc);
+        if (input)
+          add(
+            id,
+            visual(
+              {
+                src: input.value,
+                img_width: q('[name="img_width"]', doc)?.value,
+                img_height: q('[name="img_height"]', doc)?.value
+              },
+              kind,
+              base
+            )
+          );
+      }
+      if (id && kind === 'item') {
+        const input = q('input[name="src"]', doc);
+        if (input) add(id, visual({ src: input.value }, kind, base));
+      }
+      if (id && kind === 'map') {
+        const ground = q('#ground', doc);
+        add(id, ground ? background(ground, kind, base) : null);
+        if (!out.has(id)) add(id, visual({ src: q('#map_src', doc)?.value }, kind, base));
+      }
+      return Array.from(out.values());
+    }
+
+    function enrich(records, kind) {
+      return records.map((record) => {
+        const own = visual(record, kind);
+        const old = saved.get(kind + ':' + record.id);
+        const data = own ? { ...own, frame: own.frame || (old?.src === own.src ? old.frame : null) } : old;
+        return { ...record, src: data?.src || '', frame: data?.frame || null };
+      });
+    }
+
+    function node(record, { size = 56 } = {}) {
+      size = Math.min(256, Math.max(16, Number(size) || 56));
+      const box = el('span', {
+        class: 'dp-media',
+        role: 'img',
+        'aria-label': record?.name ? 'Grafika: ' + record.name : 'Grafika obiektu'
+      });
+      box.style.width = size + 'px';
+      box.style.height = size + 'px';
+      const fallback = () => {
+        box.classList.add('dp-media-empty');
+        box.setAttribute('aria-label', 'Brak grafiki');
+        box.replaceChildren(el('span', { text: 'Brak grafiki' }));
+      };
+      const data = visual(record, '');
+      if (!data) {
+        fallback();
+        return box;
+      }
+      const crop = el('span', { class: 'dp-media-frame' });
+      const image = el('img', {
+        class: 'dp-media-img',
+        alt: '',
+        loading: 'lazy',
+        decoding: 'async',
+        referrerpolicy: 'no-referrer'
+      });
+      crop.style.width = size + 'px';
+      crop.style.height = size + 'px';
+      image.style.opacity = '0';
+      image.addEventListener('error', fallback, { once: true });
+      image.addEventListener(
+        'load',
+        () => {
+          const originalWidth = image.naturalWidth;
+          const originalHeight = image.naturalHeight;
+          if (!originalWidth || !originalHeight) return fallback();
+          const cut = data.frame;
+          const width = cut?.width || originalWidth / (cut?.cols || 1);
+          const height = cut?.height || originalHeight / (cut?.rows || 1);
+          const x = cut?.x || 0;
+          const y = cut?.y || 0;
+          if (width + x > originalWidth || height + y > originalHeight) return fallback();
+          const scale = Math.min(2, size / width, size / height);
+          crop.style.width = width * scale + 'px';
+          crop.style.height = height * scale + 'px';
+          image.style.width = originalWidth * scale + 'px';
+          image.style.height = originalHeight * scale + 'px';
+          image.style.maxWidth = 'none';
+          image.style.maxHeight = 'none';
+          image.style.transform = `translate(${-x * scale}px, ${-y * scale}px)`;
+          image.style.opacity = '1';
+          box.classList.add('dp-media-ready');
+        },
+        { once: true }
+      );
+      crop.append(image);
+      box.append(crop);
+      image.src = data.src;
+      return box;
+    }
+
+    return { collect, enrich, node };
   }
 
   function dialogs(app) {
@@ -1264,6 +1679,437 @@
         end: out[index + 1]?.start ?? body.length,
         text: body.slice(part.start, out[index + 1]?.start ?? body.length)
       }));
+    }
+
+    function operand(value) {
+      const m = value.match(/^(G?PROGRESS)(_LAST_UPDATE)?:(-?\d+)$/);
+      if (m && int(m[3]))
+        return { value, scope: m[1][0] === 'G' ? 'global' : 'player', id: m[3], time: !!m[2], valid: true };
+      const valid =
+        natural(value) ||
+        /^(LVL|AID|CURRENCY2?|ITEM_SPACE)$/.test(value) ||
+        /^ITEM:\d+$/.test(value) ||
+        /^DATE:[^\s$]+$/.test(value) ||
+        /^RAND:\d+:\d+$/.test(value);
+      return { value, valid };
+    }
+
+    function refs(raw) {
+      const found = [];
+      const first = raw.match(
+        /^#(IFG?PROGRESS|G?PROGRESS|IFTIME|RESET_PROGRESS_LAST_DAY|RANKING)\s+(-?\d+)(?=\s|$)/
+      );
+      if (first) found.push({ scope: first[1].includes('GPROGRESS') ? 'global' : 'player', id: first[2] });
+      for (const m of raw.matchAll(/(^|[^\w\[:])(G?PROGRESS)(?:_LAST_UPDATE)?:(-?\d+)(?![\w.])/g))
+        found.push({ scope: m[2][0] === 'G' ? 'global' : 'player', id: m[3] });
+      return found.filter(
+        (item, i) =>
+          int(item.id) && found.findIndex((other) => other.scope === item.scope && other.id === item.id) === i
+      );
+    }
+
+    function fact(part, row) {
+      const raw = part.text.trimEnd();
+      const out = {
+        kind: 'other',
+        cmd: part.cmd,
+        raw,
+        start: row.start + row.offset + part.start,
+        end: row.start + row.offset + part.start + raw.length,
+        refs: refs(raw),
+        confidence: 'known'
+      };
+      if (
+        known.has(part.cmd) &&
+        !/^(IFG?PROGRESS|G?PROGRESS|IF|CHANGE|IFTIME|RESET_PROGRESS_LAST_DAY|RANKING)$/.test(part.cmd)
+      )
+        out.refs = [];
+      const route = (value) => /^(\d+|END)$/.test(value);
+      let m;
+      if (
+        (m = raw.match(/^#(IFG?PROGRESS)\s+(\S+)\s+(\S+)\s+THEN\s+->(\S+)\s+ELSE\s+->(\S+)$/)) &&
+        int(m[2]) &&
+        range(m[3]) &&
+        route(m[4]) &&
+        route(m[5])
+      ) {
+        Object.assign(out, {
+          kind: 'condition',
+          scope: m[1] === 'IFGPROGRESS' ? 'global' : 'player',
+          id: m[2],
+          value: m[3],
+          yes: m[4],
+          no: m[5],
+          editable: ![m[4], m[5]].some((id) => id === 'END' || id === '0')
+        });
+      } else if (
+        (m = raw.match(/^#(G?PROGRESS)\s+(\S+)\s+(\S+)\s+->(\S+)$/)) &&
+        int(m[2]) &&
+        (/^(\+\+|--)$/.test(m[3]) || (/^[+-]?\d+$/.test(m[3]) && Number.isSafeInteger(Number(m[3])))) &&
+        route(m[4])
+      ) {
+        Object.assign(out, {
+          kind: m[3] === '++' ? 'add' : m[3] === '--' ? 'sub' : 'set',
+          scope: m[1] === 'GPROGRESS' ? 'global' : 'player',
+          id: m[2],
+          value: ['++', '--'].includes(m[3]) ? '1' : String(Number(m[3])),
+          yes: m[4],
+          editable: !['END', '0'].includes(m[4])
+        });
+        if (/^\+\d/.test(m[3]))
+          out.note = 'Zapis ' + m[3] + ' ustawia liczbę; nie dodaje jej do starej wartości.';
+      } else if (
+        (m = raw.match(/^#CHANGE\s+(G?PROGRESS):(-?\d+)\s+([=+*/-])\s+(\S+)\s+->(\S+)$/)) &&
+        int(m[2]) &&
+        operand(m[4]).valid &&
+        route(m[5])
+      ) {
+        Object.assign(out, {
+          kind: { '=': 'set', '+': 'add', '-': 'sub', '*': 'mul', '/': 'div' }[m[3]],
+          scope: m[1] === 'GPROGRESS' ? 'global' : 'player',
+          id: m[2],
+          value: m[4],
+          yes: m[5],
+          operand: operand(m[4]),
+          editable: ['=', '+', '-'].includes(m[3]) && natural(m[4]) && m[5] !== '0'
+        });
+        if (m[3] === '/' && Number(m[4]) === 0) out.note = 'Dzielenie przez 0 kończy się błędem.';
+      } else if (
+        (m = raw.match(/^#IF\s+(\S+)\s+(>=|<=|!=|=|>|<)\s+(\S+)\s+THEN\s+->(\S+)\s+ELSE\s+->(\S+)$/)) &&
+        operand(m[1]).valid &&
+        operand(m[3]).valid &&
+        route(m[4]) &&
+        route(m[5])
+      ) {
+        Object.assign(out, {
+          kind: 'compare',
+          left: operand(m[1]),
+          compare: m[2],
+          right: operand(m[3]),
+          yes: m[4],
+          no: m[5]
+        });
+      } else if (
+        (m = raw.match(/^#IFTIME\s+(-?\d+)\s+(\d+)\s+THEN\s+->(\S+)\s+ELSE\s+->(\S+)$/)) &&
+        int(m[1]) &&
+        route(m[3]) &&
+        route(m[4])
+      ) {
+        Object.assign(out, { kind: 'time', scope: 'player', id: m[1], value: m[2], yes: m[3], no: m[4] });
+      } else if (
+        (m = raw.match(/^#RESET_PROGRESS_LAST_DAY\s+(-?\d+)\s+(-?\d+)\s+->(\S+)$/)) &&
+        int(m[1]) &&
+        int(m[2]) &&
+        route(m[3])
+      ) {
+        Object.assign(out, {
+          kind: 'reset',
+          scope: 'player',
+          id: m[1],
+          value: m[2],
+          yes: m[3],
+          note:
+            Number(m[2]) === 0
+              ? 'Parametr wartości 0: bez resetu i bez przejścia.'
+              : Number(m[1]) === 0
+                ? 'Numer 0 ma niejednoznaczny opis w dokumentacji tej komendy. Sprawdź zachowanie w grze.'
+                : 'Zeruje, gdy wartość jest równa podanej i zapis pochodzi z innego dnia. Opis komendy przewiduje następnie przejście do podanego kroku.',
+          confidence: Number(m[1]) === 0 ? 'partial' : 'known'
+        });
+      } else if ((m = raw.match(/^#RANKING\s+(-?\d+)\s+(\d+)$/)) && int(m[1]) && natural(m[2])) {
+        Object.assign(out, { kind: 'ranking', scope: 'player', id: m[1], value: m[2] });
+      } else if ((m = raw.match(/^#GO\s+->(\d+|END)$/))) Object.assign(out, { kind: 'jump', yes: m[1] });
+      else if ((m = raw.match(/^#RAND\s+(\d+(?:\s+\d+)*)$/)))
+        Object.assign(out, { kind: 'random', targets: m[1].split(/\s+/) });
+      else if ((m = raw.match(/^#GONPC\s+(\d+)\s+->(\d+)$/)))
+        Object.assign(out, { kind: 'npc', npc: m[1], yes: m[2] });
+      else if (raw === '#END') out.kind = 'end';
+      else if (
+        /^(IFG?PROGRESS|G?PROGRESS|IF|CHANGE|IFTIME|RESET_PROGRESS_LAST_DAY|RANKING|GO|RAND|GONPC)$/.test(
+          part.cmd
+        )
+      ) {
+        out.confidence = 'partial';
+        out.note =
+          'Nie rozpoznano w pełni składni tego polecenia. Może zawierać dynamiczne wartości lub skróty.';
+      } else if (!known.has(part.cmd)) {
+        out.confidence = 'partial';
+        out.note = 'Nieznane polecenie. Jego możliwe użycia progressów wymagają sprawdzenia w źródle.';
+      }
+      if (out.kind === 'other' && jumps.has(part.cmd) && !['GONPC', 'RAND'].includes(part.cmd))
+        out.targets = [...raw.matchAll(/->(END|\d+)(?![\w.])/g)].map((match) => match[1]);
+      if (row.reply) {
+        out.confidence = 'inactive';
+        out.editable = false;
+        out.note =
+          'To polecenie nie wykonuje czynności w odpowiedzi gracza. Sprawdź treść; warunki widoczności działają tylko na początku i w ustalonej kolejności.';
+      }
+      return out;
+    }
+
+    function inspect(row) {
+      const facts = [];
+      const warnings = [];
+      const parts = chunks(row.body);
+      let prefix = 0;
+      if (row.reply) {
+        for (const cmd of order) {
+          const rest = row.body.slice(prefix);
+          const re = cmd.includes('PROGRESS')
+            ? new RegExp('^#' + cmd + '\\s+(-?\\d+)\\s+(\\S+)\\s+')
+            : new RegExp('^#' + cmd + '\\s+(\\d+)\\s+');
+          const m = rest.match(re);
+          if (!m || (cmd.includes('PROGRESS') && !range(m[2]))) continue;
+          const isProgress = cmd.includes('PROGRESS');
+          const scope = cmd === 'IFGPROGRESS' ? 'global' : 'player';
+          facts.push({
+            kind: isProgress ? 'visible' : 'visibleOther',
+            cmd,
+            scope,
+            id: m[1],
+            value: m[2],
+            raw: m[0].trimEnd(),
+            start: row.start + row.offset + prefix,
+            end: row.start + row.offset + prefix + m[0].trimEnd().length,
+            refs: isProgress ? [{ scope, id: m[1] }] : [],
+            confidence: 'known',
+            editable: isProgress
+          });
+          prefix += m[0].length;
+        }
+      }
+      parts
+        .filter((part) => part.start >= prefix)
+        .forEach((part) => {
+          if (row.reply && icons.some((icon) => icon[0] === part.cmd)) return;
+          facts.push(fact(part, row));
+        });
+      for (const m of row.body.matchAll(/\[(PVAL|PGVAL|PROGRESS|GPROGRESS):(-?\d+)((?:[+-]\d+)?)\]/g)) {
+        const scope = ['PGVAL', 'GPROGRESS'].includes(m[1]) ? 'global' : 'player';
+        const owner = parts.find((part) => m.index >= part.start && m.index < part.end);
+        const inactive = row.reply || owner?.cmd === 'MESSAGE';
+        facts.push({
+          kind: 'value',
+          scope,
+          id: m[2],
+          value: m[3],
+          raw: m[0],
+          refs: [{ scope, id: m[2] }],
+          confidence: inactive ? 'inactive' : 'known',
+          note: inactive
+            ? 'Ten znacznik nie jest podmieniany w ' + (row.reply ? 'odpowiedzi gracza.' : '#MESSAGE.')
+            : m[3][0] === '-'
+              ? 'Minus w tym znaczniku nie odejmuje; silnik pokazuje samą wartość.'
+              : ''
+        });
+      }
+      if (row.reply) {
+        const arrow = row.body.match(/->(END|\d+)\s*$/);
+        facts.push({
+          kind: 'reply',
+          yes: arrow?.[1] || (!row.body.includes('->') ? 'END' : ''),
+          refs: [],
+          confidence: arrow || !row.body.includes('->') ? 'known' : 'partial',
+          raw: arrow?.[0] || '',
+          note:
+            !arrow && row.body.includes('->')
+              ? 'Przejście odpowiedzi ma nietypowy zapis; sprawdź je w źródle.'
+              : ''
+        });
+      }
+      if (!row.reply && parts.filter((part) => jumps.has(part.cmd)).length > 1)
+        warnings.push(
+          'Kilka poleceń z przejściem: silnik ma własną kolejność. Po pierwszym wykonanym przejściu pozostałe mogą się nie wykonać.'
+        );
+      if (/\$[^$\r\n]+\$/.test(row.body))
+        warnings.push(
+          'Skróty $…$ są rozwijane przez grę. Podsumowanie nie rozstrzyga ukrytych w nich numerów ani poleceń.'
+        );
+      if (/<br\s+\/>/i.test(row.body))
+        warnings.push('<br /> ucina krok. Sprawdź dalszy fragment w źródle; do podziału tekstu używaj <br>.');
+      if (
+        !row.reply &&
+        facts.some(
+          (item) => (item.yes === 'END' && !['GO', 'CHANGE'].includes(item.cmd)) || item.no === 'END'
+        )
+      )
+        warnings.push(
+          '->END jest dozwolone tylko w odpowiedzi, #GO i #CHANGE. W pozostałych poleceniach wybierz numer kroku z #END.'
+        );
+      let words = row.reply
+        ? row.body
+            .slice(prefix)
+            .replace(/\s*->(?:END|\d+)\s*$/, '')
+            .replace(/(^| )#(?:QUEST|CQUEST|BATTLE|SHOP|GAME|HEAL|LINE|EXIT)\b/g, ' ')
+        : row.body.slice(0, parts[0]?.start ?? row.body.length);
+      words = words.trim();
+      return { ...row, facts, warnings, words };
+    }
+
+    function scan(text) {
+      const rows = talk(text)
+        .filter((row) => row.key && row.key !== '0')
+        .map(inspect);
+      const uses = new Map();
+      const gaps = [];
+      const counts = new Map();
+      rows.forEach((row) => counts.set(row.key, (counts.get(row.key) || 0) + 1));
+      rows.forEach((row) => {
+        if (counts.get(row.key) > 1)
+          row.warnings.push(
+            'Powtórzony numer linii. Gra może użyć innego wystąpienia; popraw konflikt w źródle.'
+          );
+        row.warnings.forEach((reason) => gaps.push({ key: row.key, line: row.index + 1, reason }));
+        row.facts.forEach((item) => {
+          if (item.confidence !== 'known')
+            gaps.push({
+              key: row.key,
+              line: row.index + 1,
+              reason: item.note || 'Nie w pełni rozpoznany fragment.',
+              raw: item.raw
+            });
+          item.refs.forEach((ref) => {
+            const key = ref.scope + ':' + ref.id;
+            if (!uses.has(key)) uses.set(key, { ...ref, key, refs: [] });
+            const kind =
+              item.id === ref.id && item.scope === ref.scope
+                ? item.kind
+                : ['set', 'add', 'sub', 'mul', 'div'].includes(item.kind)
+                  ? 'read'
+                  : item.kind;
+            uses
+              .get(key)
+              .refs.push({
+                key: row.key,
+                line: row.index + 1,
+                kind,
+                confidence: counts.get(row.key) > 1 ? 'partial' : item.confidence,
+                raw: item.raw
+              });
+          });
+        });
+      });
+      talk(text)
+        .filter((row) => !row.key && row.raw.trim() && !/^(\/\/|DEV\.)/.test(row.raw))
+        .forEach((row) =>
+          gaps.push({
+            key: '',
+            line: row.index + 1,
+            reason: 'Linia poza rozpoznanym formatem kroków. Zachowano ją bez zmian.',
+            raw: row.raw
+          })
+        );
+      return {
+        rows,
+        uses: [...uses.values()].sort(
+          (a, b) => a.scope.localeCompare(b.scope) || Number(a.id) - Number(b.id)
+        ),
+        gaps
+      };
+    }
+
+    function progressName(id, scope, quests) {
+      const name =
+        app.aliases?.()[scope + ':' + id]?.name || (scope === 'player' ? quests.get(id)?.name : '');
+      return (
+        (scope === 'global' ? 'Globalny progress #' : 'Progress gracza #') + id + (name ? ' · ' + name : '')
+      );
+    }
+
+    function valueText(value) {
+      const m = String(value).match(/^(-?\d+)?\.\.(-?\d+)?$/);
+      return !m
+        ? value
+        : m[1] && m[2]
+          ? 'od ' + m[1] + ' do ' + m[2]
+          : m[1]
+            ? 'co najmniej ' + m[1]
+            : 'co najwyżej ' + m[2];
+    }
+
+    function describe(item, quests) {
+      const name = item.id ? progressName(item.id, item.scope, quests) : '';
+      const dest = (id) =>
+        id === 'END' ? 'koniec rozmowy' : id ? 'krok ' + id : 'cel do sprawdzenia w źródle';
+      const expression = (part) =>
+        part.scope
+          ? (part.time ? 'sekundy od ostatniej zmiany: ' : '') + progressName(part.id, part.scope, quests)
+          : part.value;
+      const routes = ' Tak → ' + dest(item.yes) + '; nie → ' + dest(item.no) + '.';
+      let text;
+      if (item.kind === 'condition')
+        text =
+          name +
+          ': wartość ' +
+          (String(item.value).includes('..') ? valueText(item.value) : '= ' + item.value) +
+          '.' +
+          routes;
+      else if (item.kind === 'visible')
+        text = 'Odpowiedź widoczna, gdy ' + name + ' ma wartość ' + valueText(item.value) + '.';
+      else if (item.kind === 'visibleOther')
+        text =
+          item.cmd === 'IFITEM'
+            ? 'Odpowiedź widoczna z przedmiotem szablonu #' + item.id + '.'
+            : 'Odpowiedź widoczna od poziomu obozu ' + item.id + '.';
+      else if (['set', 'add', 'sub', 'mul', 'div'].includes(item.kind))
+        text =
+          name +
+          ': ' +
+          { set: 'ustaw na ', add: 'dodaj ', sub: 'odejmij ', mul: 'pomnóż przez ', div: 'podziel przez ' }[
+            item.kind
+          ] +
+          (item.operand ? expression(item.operand) : item.value) +
+          ' → ' +
+          dest(item.yes) +
+          '.';
+      else if (item.kind === 'compare')
+        text =
+          'Porównaj ' +
+          expression(item.left) +
+          ' ' +
+          item.compare +
+          ' ' +
+          expression(item.right) +
+          '.' +
+          routes;
+      else if (item.kind === 'time')
+        text =
+          name +
+          ': od zapisu minęło więcej niż ' +
+          item.value +
+          ' minut.' +
+          routes +
+          ' Nigdy nie zapisano → nie.';
+      else if (item.kind === 'reset')
+        text =
+          name + ': dzienny reset przy wartości ' + item.value + ', cel zapisany: ' + dest(item.yes) + '.';
+      else if (item.kind === 'ranking')
+        text = 'Pokaż ranking według ' + name + ', limit ' + item.value + '. Odczytuje wartości kont graczy.';
+      else if (item.kind === 'value')
+        text =
+          'Odczyt wartości: ' +
+          name +
+          (item.value?.[0] === '+' ? ', w tekście powiększonej o ' + item.value.slice(1) : '') +
+          '. Nie zmienia progressu.';
+      else if (item.kind === 'reply') text = 'Po kliknięciu → ' + dest(item.yes) + '.';
+      else if (item.kind === 'jump') text = 'Przejdź do: ' + dest(item.yes) + '.';
+      else if (item.kind === 'random') text = 'Losuj dalszy krok: ' + item.targets.join(', ') + '.';
+      else if (item.kind === 'npc')
+        text = 'Otwórz dialog innego NPC #' + item.npc + ', krok ' + item.yes + '.';
+      else if (item.kind === 'end') text = 'Zakończ rozmowę.';
+      else if (item.cmd === 'NEWQUEST' && item.confidence === 'known')
+        text =
+          'Pokaż powiadomienie „Rozpoczęto quest!”. Samo #NEWQUEST nie zapisuje progressu ani nie dodaje etapu zadania.';
+      else
+        text =
+          '#' +
+          item.cmd +
+          ' · ' +
+          (item.confidence === 'known'
+            ? 'pozostałe polecenie — szczegóły w źródle.'
+            : 'składnia do sprawdzenia w źródle.') +
+          (item.targets?.length ? ' Cele zapisane: ' + item.targets.map(dest).join(', ') + '.' : '');
+      return (item.confidence === 'inactive' ? 'Nie wykonuje się tutaj: ' : '') + text;
     }
 
     function edges(text) {
@@ -1393,7 +2239,7 @@
     function flow(text, data) {
       if (!int(data.id)) throw new Error('Wybierz progress albo wpisz jego numer.');
       const draft = plan(text);
-      const first = draft.take();
+      const first = data.edit ? data.edit.key : draft.take();
       const scope = data.scope === 'global' ? 'GPROGRESS' : 'PROGRESS';
       let command;
       if (data.op === 'condition') {
@@ -1434,17 +2280,31 @@
             next;
         }
       }
-      draft.added.unshift(first + '. ' + command);
-      if (data.attach === 'reply') {
+      if (data.edit) {
+        unique(talk(text), data.edit.key);
+        if (text.slice(data.edit.start, data.edit.end) !== data.edit.raw)
+          throw new Error('Polecenie zmieniło się. Otwórz je ponownie.');
+        draft.source = text.slice(0, data.edit.start) + command + text.slice(data.edit.end);
+      } else draft.added.unshift(first + '. ' + command);
+      if (!data.edit && data.attach === 'reply') {
         unique(roots(text), data.parent);
         draft.added.push(replyKey(text, data.parent) + ' ' + replyText(data.answer) + ' ->' + first);
-      } else if (data.attach === 'edge') {
+      } else if (!data.edit && data.attach === 'edge') {
         const edge = edges(text).find((item) => item.id === data.edge);
         if (!edge) throw new Error('Wybierz przejście, w które wstawisz nowy krok.');
         unique(talk(text), edge.key);
         draft.source = text.slice(0, edge.start) + '->' + first + text.slice(edge.end);
+      } else if (!data.edit && data.attach === 'ending') {
+        const row = unique(talk(text), data.parent);
+        if (!row.reply || row.body.includes('->') || /\$[^$]+\$/.test(row.body))
+          throw new Error('To zakończenie odpowiedzi wymaga sprawdzenia w źródle. Wybierz jawne przejście.');
+        draft.source = replace(text, row, row.raw + ' ->' + first);
       }
-      return { text: draft.finish(), code: draft.added.join('\n'), first };
+      return {
+        text: draft.finish(),
+        code: (data.edit ? [first + '. ' + command, ...draft.added] : draft.added).join('\n'),
+        first
+      };
     }
 
     function visible(body, scope, id, value, overwrite) {
@@ -1478,7 +2338,7 @@
       return next.map((part) => part.raw).join(' ') + ' ' + rest;
     }
 
-    function apply(control, before, after) {
+    function apply(control, before, after, done = () => {}) {
       if (!app.check(control)) {
         note('To pole nie jest teraz dostępne do edycji.', 'error');
         return false;
@@ -1490,9 +2350,13 @@
         );
         return false;
       }
-      if (before === after) return true;
+      if (before === after) {
+        done();
+        return true;
+      }
       if (app.set(control, after) === false) return false;
       note('Wstawiono do formularza. Zapisz zmiany przyciskiem strony.');
+      done();
       return true;
     }
 
@@ -1526,7 +2390,13 @@
       return { box, choice, words, refresh: update, value: () => ({ id: choice.value, text: words.value }) };
     }
 
-    function picker(kind, label, changed = () => {}, scope = () => 'player') {
+    function picker(
+      kind,
+      label,
+      changed = () => {},
+      scope = () => 'player',
+      named = (record) => record.name || '#' + record.id
+    ) {
       const id = input('', { inputmode: 'numeric', placeholder: 'Numer lub wybór z listy' });
       const name = el('span', { class: 'dp-help', text: 'Wybierz po nazwie; numer zostanie uzupełniony.' });
       const pick = button('Wybierz z listy', () =>
@@ -1534,7 +2404,7 @@
           kind,
           (record) => {
             id.value = String(record.id);
-            name.textContent = record.name || '#' + record.id;
+            name.textContent = named(record);
             changed();
           },
           { value: id.value, scope: scope() }
@@ -1587,51 +2457,85 @@
       return update;
     }
 
-    function progress(control, chosen = '') {
+    function progress(control, chosen = null, done = () => {}, edit = null) {
       const source = control.value;
       const caret = { start: control.selectionStart, end: control.selectionEnd };
       const rows = talk(source);
       const stepRows = roots(source);
       const replies = rows.filter((row) => row.reply);
-      const paths = edges(source);
-      const box = modal('Kreator progressu');
+      if (typeof chosen === 'string') chosen = rows.find((row) => row.key === chosen) || null;
+      if (chosen && source.slice(chosen.start, chosen.end) !== chosen.raw) {
+        note('Ta linia zmieniła się. Odśwież listę kroków.', 'error');
+        return;
+      }
+      const paths = edges(source).filter((path) => !chosen || path.key === chosen.key);
+      const box = modal(
+        edit
+          ? 'Zmień działanie · ' + chosen.key
+          : 'Dodaj progress · ' + (chosen ? (chosen.reply ? 'odpowiedź ' : 'krok ') + chosen.key : 'dialog')
+      );
       help(box);
+      if (chosen)
+        box.body.append(
+          el('p', {
+            class: 'dp-card',
+            text: (chosen.reply ? 'Odpowiedź ' : 'Krok ') + chosen.key + ' · ' + short(chosen.body)
+          })
+        );
+      const options = [
+        ['condition', 'Sprawdź wartość i wybierz dalszy krok'],
+        ['set', 'Ustaw konkretną wartość'],
+        ['add', 'Dodaj do obecnej wartości'],
+        ['sub', 'Odejmij od obecnej wartości'],
+        ['visible', 'Pokaż odpowiedź tylko przy wybranej wartości'],
+        ['value', 'Pokaż wartość w wypowiedzi NPC']
+      ];
       const op = select(
-        [
-          ['condition', 'Sprawdź wartość i wybierz dalszy krok'],
-          ['set', 'Ustaw wartość'],
-          ['add', 'Dodaj do wartości'],
-          ['sub', 'Odejmij od wartości'],
-          ['visible', 'Warunek widoczności odpowiedzi'],
-          ['value', 'Pokaż wartość w wypowiedzi']
-        ],
-        'condition'
+        options.filter(
+          ([id]) =>
+            !edit ||
+            (edit.kind === 'visible' ? id === 'visible' : ['condition', 'set', 'add', 'sub'].includes(id))
+        ),
+        edit?.kind || (chosen?.reply ? 'visible' : 'condition')
       );
       const scope = select(
         [
-          ['player', 'Progress gracza'],
-          ['global', 'Progress całego świata']
+          ['player', 'Gracza — osobna wartość dla każdego konta'],
+          ['global', 'Świata — wspólna wartość dla wszystkich']
         ],
-        'player'
+        edit?.scope || 'player'
       );
+      if (edit?.kind === 'visible') scope.disabled = true;
+      const purpose = el('p', { class: 'dp-help', role: 'status' });
+      const questNote = el('p', { class: 'dp-help', role: 'status' });
+      let questMap = new Map();
+      const questJob = app
+        .list('quest')
+        .then((result) => {
+          questMap = new Map(result.map((record) => [String(record.id), record]));
+        })
+        .catch(() => {});
       let update = () => {};
       let stageRequest = 0;
+      let hasStages = false;
       const stages = select([['', 'Wpisz własną wartość']], '');
       const stageField = field(
-        'Etap z Questloga',
+        'Etap potwierdzonego questa',
         stages,
-        'Nazwy etapów są opisem istniejącego zadania. Zakresu nie można użyć jako konkretnej wartości zapisu.'
+        'Ten quest czyta progress gracza o tym samym ID. Zakres etapu służy do warunku; zapis wymaga jednej liczby.'
       );
       const selected = picker(
         'progress',
-        'Progress',
+        'ID progressu',
         () => {
           loadStages();
           update();
         },
-        () => scope.value
+        () => scope.value,
+        (record) => progressName(String(record.id), scope.value, questMap)
       );
-      const value = input('0', { inputmode: 'numeric' });
+      selected.id.value = edit?.id || '';
+      const value = input(edit?.value || '0', { inputmode: 'numeric' });
       const last = input('', { inputmode: 'numeric', placeholder: 'Pusta granica = bez ograniczenia' });
       const compare = select(
         [
@@ -1643,21 +2547,30 @@
         ],
         'equal'
       );
+      const initialRange = edit?.value?.match(/^(-?\d+)?\.\.(-?\d+)?$/);
+      if (initialRange) {
+        compare.value = 'range';
+        value.value = initialRange[1] || '';
+        last.value = initialRange[2] || '';
+      }
       const compareField = field('Porównanie', compare);
-      const valueField = field('Wartość', value);
+      const valueField = field(
+        'Wartość',
+        value,
+        'To stan lub licznik zapisany pod wybranym ID, a nie numer kroku rozmowy.'
+      );
       const lastField = field('Górna granica', last);
       const values = el('div', { class: 'dp-grid' }, compareField, valueField, lastField);
-      const attach = select(
-        [
-          ['reply', 'Nowa odpowiedź prowadząca do operacji'],
-          ['edge', 'Wstaw w istniejące przejście'],
-          ['alone', 'Nowy krok do późniejszego podłączenia']
-        ],
-        stepRows.length ? 'reply' : 'alone'
-      );
+      const places = [];
+      if (!chosen?.reply && stepRows.length) places.push(['reply', 'Po kliknięciu nowej odpowiedzi gracza']);
+      if (paths.length) places.push(['edge', 'W wybranym przejściu z tej linii']);
+      if (chosen?.reply && !chosen.body.includes('->') && !/\$[^$]+\$/.test(chosen.body))
+        places.push(['ending', 'Po kliknięciu tej odpowiedzi, przed zakończeniem']);
+      places.push(['alone', 'Osobny krok — podłączę go później']);
+      const attach = select(places, paths.length === 1 ? 'edge' : places[0][0]);
       const parent = select(
         [['', 'Wybierz krok NPC…'], ...stepRows.map((row) => [row.key, row.key + ' · ' + short(row.body)])],
-        chosen
+        chosen?.reply ? chosen.parent : chosen?.key || ''
       );
       const answer = input('', { placeholder: 'Np. Odbieram nagrodę.' });
       const replyBox = el(
@@ -1666,11 +2579,18 @@
         field('Krok z nową odpowiedzią', parent),
         field('Treść odpowiedzi', answer)
       );
-      const edge = select([['', 'Wybierz przejście…'], ...paths.map((path) => [path.id, path.label])], '');
+      const edge = select(
+        [['', 'Wybierz przejście…'], ...paths.map((path) => [path.id, path.label])],
+        paths.length === 1 ? paths[0].id : ''
+      );
       const edgeField = field('Przejście, które ma prowadzić przez nowy krok', edge);
       const alone = el('p', {
         class: 'dp-help',
         text: 'Nowy krok zostanie dopisany. Nie połączy się z istniejącymi krokami, dopóki nie ustawisz prowadzącego do niego przejścia.'
+      });
+      const ending = el('p', {
+        class: 'dp-help',
+        text: 'Ta odpowiedź dotąd kończyła rozmowę. Po kliknięciu wykona nową czynność, a następnie przejdzie do wskazanego niżej celu.'
       });
       const wiring = el(
         'div',
@@ -1678,19 +2598,24 @@
         field('Miejsce operacji', attach),
         replyBox,
         edgeField,
-        alone
+        alone,
+        ending
       );
-      const yes = target(source, 'Gdy spełniony / po wykonaniu');
-      const no = target(source, 'Gdy niespełniony');
+      const yes = target(
+        source,
+        'Gdy spełniony / po wykonaniu',
+        edit?.yes || (attach.value === 'edge' ? paths[0]?.target : attach.value === 'ending' ? '@end' : '')
+      );
+      const no = target(source, 'Gdy niespełniony', edit?.no || '');
       const routes = el('div', { class: 'dp-grid' }, yes.box, no.box);
       const reply = select(
         [
           ['', 'Wybierz odpowiedź…'],
           ...replies.map((row) => [String(row.index), row.key + ' · ' + short(row.body)])
         ],
-        ''
+        chosen?.reply ? String(chosen.index) : ''
       );
-      const overwrite = el('input', { type: 'checkbox' });
+      const overwrite = el('input', { type: 'checkbox', checked: edit?.kind === 'visible' });
       const visibility = el(
         'div',
         { class: 'dp-stack' },
@@ -1706,7 +2631,7 @@
           ['', 'Wybierz wypowiedź…'],
           ...stepRows.map((row) => [String(row.index), row.key + ' · ' + short(row.body)])
         ],
-        stepRows.find((row) => row.key === chosen)?.index?.toString() || ''
+        !chosen?.reply && chosen ? String(chosen.index) : ''
       );
       const position = select(
         [
@@ -1723,8 +2648,10 @@
       );
       box.body.append(
         field('Czynność', op),
+        purpose,
         field('Zakres', scope),
         selected.box,
+        questNote,
         stageField,
         values,
         wiring,
@@ -1735,19 +2662,53 @@
 
       async function loadStages() {
         const request = ++stageRequest;
+        const id = selected.id.value.trim();
+        hasStages = false;
         stages.replaceChildren(el('option', { value: '', text: 'Wpisz własną wartość' }));
-        if (!int(selected.id.value) || scope.value !== 'player') return;
+        selected.name.textContent = int(id)
+          ? progressName(id, scope.value, questMap) + (Number(id) < 0 ? ' · numer systemowy' : '')
+          : 'Wybierz po nazwie albo wpisz ID progressu.';
+        questNote.textContent =
+          scope.value === 'global'
+            ? 'To wartość wspólna dla świata. Numer zgodny z questem gracza nie nadaje jej jego nazwy ani etapów.'
+            : int(id)
+              ? 'Sprawdzam, czy temu ID odpowiada dostępny quest…'
+              : 'ID wybiera zmienną. Wartość niżej określa jej stan; cele przejść wybierają numery kroków dialogu.';
+        layout();
+        if (!int(id) || scope.value !== 'player') return;
+        const current = () =>
+          request === stageRequest &&
+          box.box.isConnected &&
+          app.check(control) &&
+          scope.value === 'player' &&
+          selected.id.value.trim() === id;
         try {
-          const result = await app.stages(selected.id.value);
-          if (request !== stageRequest) return;
+          await questJob;
+          if (!current()) return;
+          selected.name.textContent = progressName(id, 'player', questMap);
+          if (!questMap.has(id)) {
+            questNote.textContent =
+              'Brak potwierdzonego questa o tym ID w dostępnych danych. Wpisz wartość zgodną z logiką dialogu; nie każdy progress jest questem.';
+            return;
+          }
+          questNote.textContent =
+            'Potwierdzony quest: ' +
+            questMap.get(id).name +
+            '. Jego etapy opisują wyłącznie progress gracza #' +
+            id +
+            '.';
+          const result = await app.stages(id);
+          if (!current()) return;
           result.forEach((stage) =>
             stages.append(
               el('option', { value: stage.value, text: stage.value + ' · ' + short(stage.label) })
             )
           );
+          hasStages = result.length > 0;
+          if (!hasStages) questNote.textContent += ' Opisy etapów są niedostępne; wpisz wartość ręcznie.';
+          layout();
         } catch {
-          if (request === stageRequest)
-            stages.append(el('option', { value: '', text: 'Etapy niedostępne — wpisz wartość' }));
+          if (current()) questNote.textContent = 'Nie udało się odczytać etapów. Wpisz wartość ręcznie.';
         }
       }
 
@@ -1757,13 +2718,15 @@
         values.hidden = op.value === 'value';
         compareField.hidden = !test;
         lastField.hidden = !test || compare.value !== 'range';
-        stageField.hidden = scope.value !== 'player' || ['value', 'add', 'sub'].includes(op.value);
-        wiring.hidden = !logic;
+        stageField.hidden =
+          !hasStages || scope.value !== 'player' || ['value', 'add', 'sub'].includes(op.value);
+        wiring.hidden = !logic || !!edit;
         routes.hidden = !logic;
         no.box.hidden = op.value !== 'condition';
         replyBox.hidden = attach.value !== 'reply';
         edgeField.hidden = attach.value !== 'edge';
         alone.hidden = attach.value !== 'alone';
+        ending.hidden = attach.value !== 'ending';
         visibility.hidden = op.value !== 'visible';
         valueSpot.hidden = op.value !== 'value';
         valueField.querySelector('.dp-label').textContent =
@@ -1772,6 +2735,24 @@
             : ['add', 'sub'].includes(op.value)
               ? 'O ile zmienić'
               : 'Wartość';
+        purpose.textContent = {
+          condition:
+            'Warunek tylko odczytuje wartość. Rozmowa idzie do jednego z dwóch kroków; progress nie zmienia się.',
+          set: 'Ustawienie zastępuje dotychczasową wartość. Ustaw 2 oznacza zapisz 2 niezależnie od starej liczby. Zapis odświeża też datę zmiany.',
+          add: 'Dodawanie użyje #CHANGE. Dodaj 10 oznacza stara wartość + 10; samo #PROGRESS z +10 ustawiłoby stałą 10.',
+          sub: 'Odejmowanie użyje #CHANGE. Odejmij 10 oznacza stara wartość − 10; #PROGRESS z -10 ustawiłoby stałą -10.',
+          visible:
+            'Ten warunek tylko pokazuje lub ukrywa odpowiedź. Niczego nie zapisuje. Czynności po kliknięciu umieść w osobnym kroku.',
+          value:
+            'Znacznik pokaże wartość w wypowiedzi NPC. Nie zmienia progressu i nie działa w odpowiedziach gracza ani w #MESSAGE.'
+        }[op.value];
+        if (edit?.kind === 'visible')
+          purpose.textContent +=
+            ' Edytujesz warunek wybranego zakresu. Warunek drugiego zakresu dodaj osobno.';
+        if (logic)
+          purpose.textContent += edit
+            ? ' Zmieniasz wyłącznie wybrane polecenie tej linii.'
+            : ' Czynność powstanie w nowym kroku, połączonym w miejscu wybranym poniżej.';
       }
 
       stages.addEventListener('change', () => {
@@ -1788,6 +2769,7 @@
       scope.addEventListener('change', () => {
         loadStages();
         layout();
+        update();
       });
       [op, compare, attach].forEach((control) => control.addEventListener('change', layout));
       edge.addEventListener('change', () => {
@@ -1795,12 +2777,32 @@
         if (path) yes.choice.value = ['END', '0'].includes(path.target) ? '@end' : path.target;
         yes.refresh();
       });
+      attach.addEventListener('change', () => {
+        if (attach.value === 'ending') {
+          yes.choice.value = '@end';
+          yes.refresh();
+        }
+      });
       layout();
+      const state = () =>
+        JSON.stringify([
+          op.value,
+          scope.value,
+          selected.id.value.trim(),
+          compare.value,
+          value.value,
+          last.value,
+          yes.value(),
+          no.value(),
+          reply.value
+        ]);
+      const original = state();
       update = review(
         box,
         () => {
           const id = selected.id.value.trim();
           if (!int(id)) throw new Error('Wybierz progress albo wpisz jego numer.');
+          if (edit && original === state()) return { text: source, code: edit.raw };
           if (op.value === 'visible') {
             if (compare.value === 'not')
               throw new Error(
@@ -1849,18 +2851,20 @@
             last: last.value.trim(),
             compare: compare.value,
             attach: attach.value,
-            parent: parent.value,
+            parent: attach.value === 'ending' ? chosen.key : parent.value,
             answer: answer.value,
             edge: edge.value,
             yes: yes.value(),
-            no: no.value()
+            no: no.value(),
+            edit: edit ? { ...edit, key: chosen.key } : null
           });
         },
-        (result) => apply(control, source, result.text)
+        (result) => apply(control, source, result.text, done)
       );
+      loadStages();
     }
 
-    function editLine(control, row, quest = false) {
+    function editLine(control, row, quest = false, done = () => {}) {
       const source = control.value;
       if (source.slice(row.start, row.end) !== row.raw) {
         note('Ta linia zmieniła się. Otwórz ją ponownie.', 'error');
@@ -1921,11 +2925,11 @@
               code;
           return { text: replace(source, row, next), code: next };
         },
-        (result) => apply(control, source, result.text)
+        (result) => apply(control, source, result.text, done)
       );
     }
 
-    function newStep(control) {
+    function newStep(control, done = () => {}) {
       const source = control.value;
       const draft = plan(source);
       const id = draft.take();
@@ -1949,11 +2953,11 @@
           const line = id + '. ' + textLine(words.value);
           return { text: append(source, [line]), code: line };
         },
-        (result) => apply(control, source, result.text)
+        (result) => apply(control, source, result.text, done)
       );
     }
 
-    function newReply(control, parentKey = '') {
+    function newReply(control, parentKey = '', done = () => {}) {
       const source = control.value;
       const box = modal('Nowa odpowiedź gracza');
       help(box);
@@ -1987,96 +2991,271 @@
           draft.added.push(line);
           return { text: draft.finish(), code: draft.added.join('\n') };
         },
-        (result) => apply(control, source, result.text)
+        (result) => apply(control, source, result.text, done)
       );
     }
 
     function blocks(control) {
-      const box = modal('Kroki i odpowiedzi');
+      const box = modal('Dialog i progressy');
       help(box);
-      const search = input('', { type: 'search', placeholder: 'Numer, tekst lub polecenie…' });
+      let questMap = new Map();
+      let data = scan(control.value);
+      let focus = '';
+      let view = 'steps';
+      let limit = 60;
+      const search = input('', {
+        type: 'search',
+        placeholder: 'Krok, tekst, ID progressu lub nazwa questa…'
+      });
       const list = el('div', { class: 'dp-list' });
+      const usage = el('div', { class: 'dp-stack dp-dialog-uses' });
+      const clear = button('Pokaż wszystkie kroki', () => {
+        focus = '';
+        search.value = '';
+        renderRows();
+      });
+      const stepView = el('div', { class: 'dp-stack' }, field('Szukaj w dialogu', search), clear, list);
+      const stepsTab = button('Kroki i odpowiedzi', () => switchView('steps'));
+      const usesTab = button('Progressy użyte tutaj', () => switchView('uses'));
       const actions = el(
         'div',
         { class: 'dp-row' },
-        button(
-          'Nowa wypowiedź',
-          () => {
-            box.close();
-            newStep(control);
-          },
-          'dp-primary'
-        ),
-        button('Nowa odpowiedź', () => {
-          box.close();
-          newReply(control);
+        button('Nowa wypowiedź', () => newStep(control, refresh), 'dp-primary'),
+        button('Nowa odpowiedź', () => newReply(control, '', refresh)),
+        button('Sprawdź dialog', () => checkTalk(control)),
+        button('Odśwież z pola', refresh)
+      );
+      const guide = el(
+        'details',
+        {},
+        el('summary', { text: 'Numer kroku, ID progressu i wartość — co oznaczają?' }),
+        el('p', {
+          class: 'dp-help',
+          text: 'Krok to miejsce w tej rozmowie (np. 12.). ID progressu wybiera zapisaną zmienną (np. 90), a wartość określa jej stan (np. 2 = etap zadania, jeśli tak go opisano). Te trzy liczby nie muszą być takie same. Tylko ID questa odpowiada ID jego progressu gracza.'
         }),
-        button('Kreator progressu', () => {
-          box.close();
-          progress(control);
+        el('p', {
+          class: 'dp-help',
+          text: 'Warunek odczytuje; ustawienie zastępuje liczbę; dodawanie i odejmowanie przez #CHANGE zmieniają poprzednią wartość. Warunek odpowiedzi decyduje o jej widoczności. Operacje po kliknięciu wykonuje krok NPC, do którego ona prowadzi.'
         })
       );
-      box.body.append(actions, field('Szukaj', search), list);
-      let limit = 80;
-      function render() {
+      box.body.append(
+        el('p', {
+          class: 'dp-help',
+          text: 'Wybierz krok lub odpowiedź, aby zmienić jej tekst, warunek albo zapis progressu. Opisy pokazują rozpoznaną treść źródła; nie odtwarzają silnika gry. Oryginalny graf i pole dialogu pozostają dostępne na stronie.'
+        }),
+        guide,
+        actions,
+        el('div', { class: 'dp-row' }, stepsTab, usesTab),
+        stepView,
+        usage
+      );
+
+      function switchView(next) {
+        view = next;
+        stepView.hidden = view !== 'steps';
+        usage.hidden = view !== 'uses';
+        [
+          [stepsTab, 'steps'],
+          [usesTab, 'uses']
+        ].forEach(([tab, name]) => {
+          tab.classList.toggle('dp-primary', view === name);
+          tab.setAttribute('aria-pressed', String(view === name));
+        });
+      }
+
+      function show(key) {
+        focus = key;
+        search.value = '';
+        limit = 60;
+        renderRows();
+        switchView('steps');
+      }
+
+      function renderRows() {
         list.replaceChildren();
-        const rows = talk(control.value);
+        clear.hidden = !focus;
         const term = search.value.toLocaleLowerCase('pl');
-        const found = rows.filter(
+        const found = data.rows.filter(
           (row) =>
-            row.key && Number(row.key) !== 0 && (!term || row.raw.toLocaleLowerCase('pl').includes(term))
+            (!focus || row.key === focus || row.parent === focus) &&
+            (!term ||
+              (row.raw + ' ' + row.facts.map((item) => describe(item, questMap)).join(' '))
+                .toLocaleLowerCase('pl')
+                .includes(term))
         );
         found.slice(0, limit).forEach((row) => {
+          const effects = el('ul', { class: 'dp-dialog-facts' });
+          row.facts.forEach((item) => {
+            const line = el('li', {}, el('span', { text: describe(item, questMap) }));
+            if (item.note)
+              line.append(
+                el('p', { class: item.confidence === 'known' ? 'dp-help' : 'dp-error', text: item.note })
+              );
+            if (item.editable)
+              line.append(
+                button(
+                  ['condition', 'visible'].includes(item.kind) ? 'Zmień warunek' : 'Zmień zapis',
+                  () => progress(control, row, refresh, item),
+                  'dp-small'
+                )
+              );
+            effects.append(line);
+          });
           const buttons = el(
             'div',
             { class: 'dp-row' },
-            button('Edytuj', () => {
-              box.close();
-              editLine(control, row);
-            })
+            button('Edytuj tekst / kod', () => editLine(control, row, false, refresh))
           );
           if (!row.reply)
-            buttons.append(
-              button('Dodaj odpowiedź', () => {
-                box.close();
-                newReply(control, row.key);
-              }),
-              button('Progress', () => {
-                box.close();
-                progress(control, row.key);
-              })
-            );
-          list.append(
-            el(
-              'article',
-              { class: 'dp-card' },
-              el('strong', { text: (row.reply ? 'Odpowiedź ' : 'Krok ') + row.key }),
-              el('p', { class: 'dp-preview', text: row.body }),
-              buttons
+            buttons.append(button('Dodaj odpowiedź', () => newReply(control, row.key, refresh)));
+          buttons.append(
+            button(row.reply ? 'Warunek lub czynność odpowiedzi' : 'Dodaj warunek lub zmianę', () =>
+              progress(control, row, refresh)
             )
           );
+          const card = el(
+            'article',
+            { class: 'dp-card dp-dialog-step', 'data-key': row.key },
+            el('strong', { text: (row.reply ? 'Odpowiedź ' : 'Krok ') + row.key }),
+            el('p', {
+              class: 'dp-preview',
+              text: row.words ? clean(row.words) : 'Krok z poleceniami, bez osobnej wypowiedzi.'
+            }),
+            effects
+          );
+          row.warnings.forEach((text) => card.append(el('p', { class: 'dp-error', text })));
+          card.append(
+            el(
+              'details',
+              {},
+              el('summary', { text: 'Źródło tej linii' }),
+              el('pre', { class: 'dp-code', text: row.raw })
+            ),
+            buttons
+          );
+          list.append(card);
         });
         if (!found.length)
           list.append(
             el('p', {
               class: 'dp-empty',
-              text: 'Brak pasujących kroków. Nieznane linie pozostają w polu źródłowym.'
+              text: 'Brak pasujących kroków. Nierozpoznane linie pozostają w polu źródłowym.'
             })
           );
         if (found.length > limit)
           list.append(
-            button('Pokaż następne', () => {
-              limit += 80;
-              render();
+            button('Pokaż następne kroki', () => {
+              limit += 60;
+              renderRows();
             })
           );
       }
+
+      function renderUses() {
+        usage.replaceChildren(
+          el('p', {
+            class: 'dp-help',
+            text: 'Mapa użyć wyłącznie w całym aktualnym polu tego dialogu, także poza filtrem kroków. Rozdziela progress gracza i globalny o tym samym ID. Nie jest rejestrem wszystkich numerów świata ani podglądem bieżących wartości graczy.'
+          })
+        );
+        const roles = {
+          condition: 'warunek',
+          visible: 'widoczność odpowiedzi',
+          set: 'ustawienie',
+          add: 'dodawanie',
+          sub: 'odejmowanie',
+          mul: 'mnożenie',
+          div: 'dzielenie',
+          read: 'odczyt w wyrażeniu',
+          compare: 'porównanie',
+          time: 'czas od zapisu',
+          reset: 'reset dzienny',
+          ranking: 'odczyt rankingu',
+          value: 'wartość w tekście',
+          other: 'fragment do sprawdzenia'
+        };
+        if (!data.uses.length)
+          usage.append(
+            el('p', {
+              class: 'dp-empty',
+              text: 'Nie rozpoznano jawnych numerów progressów w obsługiwanych zapisach. Skróty i nietypowe fragmenty mogą zawierać dodatkowe użycia.'
+            })
+          );
+        data.uses.forEach((item) => {
+          const links = el('div', { class: 'dp-row' });
+          const used = new Set();
+          item.refs.forEach((ref) => {
+            const label =
+              (ref.key.includes('.') ? 'Odpowiedź ' : 'Krok ') +
+              ref.key +
+              ' · ' +
+              (roles[ref.kind] || ref.kind) +
+              (ref.confidence === 'inactive'
+                ? ' · nieaktywna wzmianka'
+                : ref.confidence === 'partial'
+                  ? ' · do sprawdzenia'
+                  : '');
+            if (!used.has(label)) links.append(button(label, () => show(ref.key), 'dp-small'));
+            used.add(label);
+          });
+          const card = el(
+            'article',
+            { class: 'dp-card', 'data-progress': item.key },
+            el('strong', { text: progressName(item.id, item.scope, questMap) }),
+            links
+          );
+          if (Number(item.id) < 0)
+            card.append(
+              el('p', { class: 'dp-help', text: 'Ujemny numer jest zarezerwowany dla mechaniki systemowej.' })
+            );
+          usage.append(card);
+        });
+        const uncertain = el(
+          'details',
+          { open: data.gaps.length > 0 },
+          el('summary', { text: 'Fragmenty wymagające sprawdzenia: ' + data.gaps.length })
+        );
+        data.gaps.forEach((item) =>
+          uncertain.append(
+            el('p', {
+              class: 'dp-help',
+              text: 'Linia ' + item.line + (item.key ? ' · ' + item.key : '') + ': ' + item.reason
+            })
+          )
+        );
+        if (!data.gaps.length)
+          uncertain.append(
+            el('p', {
+              class: 'dp-help',
+              text: 'Nie wykryto niejednoznaczności objętych tym sprawdzeniem. Mapa nie rozwija skrótów świata ani zewnętrznych dialogów.'
+            })
+          );
+        usage.append(uncertain);
+        usesTab.textContent = 'Progressy użyte tutaj (' + data.uses.length + ')';
+      }
+
+      function refresh() {
+        data = scan(control.value);
+        renderRows();
+        renderUses();
+      }
       search.addEventListener('input', () => {
-        limit = 80;
-        render();
+        focus = '';
+        limit = 60;
+        renderRows();
       });
       box.foot.append(button('Zamknij', box.close));
-      render();
+      refresh();
+      switchView(view);
+      app
+        .list('quest')
+        .then((records) => {
+          if (!box.box.isConnected || !app.check(control)) return;
+          questMap = new Map(records.map((record) => [String(record.id), record]));
+          renderRows();
+          renderUses();
+        })
+        .catch(() => {});
     }
 
     function diagnose(text) {
@@ -2453,13 +3632,7 @@
     const talks = app.all('textarea[name="talk"]');
     talks
       .filter((control) => app.check(control))
-      .forEach((control) =>
-        app.tools(control, [
-          ['Kroki i odpowiedzi', () => blocks(control)],
-          ['Kreator progressu', () => progress(control)],
-          ['Sprawdź dialog', () => checkTalk(control)]
-        ])
-      );
+      .forEach((control) => app.tools(control, [['Dialog i progressy', () => blocks(control)]]));
     app
       .all('textarea[name="npc_d"]')
       .filter((control) => app.check(control))
@@ -2487,11 +3660,11 @@
         dmg: ['Obrażenia', 'line'],
         ac: ['Pancerz', 'number'],
         hp: ['Punkty życia', 'number'],
-        crit: ['Cios krytyczny (%)', 'number'],
-        crit_power: ['Siła ciosu krytycznego', 'number'],
+        crit: ['Cios krytyczny · crit', 'number'],
+        crit_power: ['Siła ciosu krytycznego · crit_power', 'number'],
         evade: ['Unik', 'number'],
         blok: ['Blok', 'number'],
-        bag: ['Pojemność torby', 'number'],
+        bag: ['Parametr torby · bag', 'number'],
         rarity: ['Rzadkość', 'rarity'],
         petslot: ['Miejsce wyposażenia maskotki', 'line'],
         unique: ['Unikatowy', 'flag'],
@@ -2499,8 +3672,8 @@
         legendary: ['Legendarny', 'flag'],
         nodepo: ['Bez odkładania do depozytu', 'flag'],
         soulbound: ['Związany z właścicielem', 'flag'],
-        upgraded: ['Ulepszony', 'flag'],
-        onlyone: ['Tylko jeden u gracza', 'flag'],
+        upgraded: ['Znacznik upgraded', 'flag'],
+        onlyone: ['Jeden u gracza · kontrola w sklepie', 'flag'],
         nobag: ['Bez wkładania do innej torby', 'flag'],
         quest: ['Przedmiot questowy', 'flag']
       })
@@ -2508,7 +3681,6 @@
     const actions = new Map(
       Object.entries({
         cash: ['Zmień walutę serwerową', 'number'],
-        cash2: ['Zmień drugą walutę', 'number'],
         message: ['Pokaż wiadomość', 'text'],
         play: ['Odtwórz dźwięk z adresu', 'line'],
         talk: ['Rozpocznij rozmowę z NPC', 'npc'],
@@ -2520,6 +3692,18 @@
     );
     const stat = q('textarea#stat, textarea[name="stat"]');
     const eat = q('textarea#eat, textarea[name="eat"]');
+    const hints = {
+      opis: 'Treść opisu. Średnik kończy parametr, dlatego nie używaj go wewnątrz opisu.',
+      bag: 'Zwykła torba: liczba miejsc, np. bag=16. Przy bagonly panel wymaga bag=1, a pola wynikają z układu bagonly. Torbę otwiera się dwuklikiem.',
+      nobag: 'Według pomocy panelu ta torba nie wejdzie do innej torby.',
+      onlyone:
+        'Sprawdzenie w sklepie: gracz może mieć tylko jeden taki przedmiot. To nie jest ogólna walidacja wszystkich sposobów otrzymania przedmiotu.',
+      rarity:
+        'Wartość parametru rarity używanego w szablonach tego świata. Osobne znaczniki unique, heroic i legendary są innym zapisem.',
+      crit: 'Wartość parametru crit w stat. Dodatek nie przelicza jednostki ani nie symuluje walki.',
+      crit_power:
+        'Wartość parametru crit_power w stat. Dodatek nie przelicza jednostki ani nie symuluje walki.'
+    };
 
     function input(value = '', type = 'text') {
       return el('input', { class: 'dp-input', type, value, step: 'any' });
@@ -2556,6 +3740,15 @@
       const detail = el('details');
       detail.append(el('summary', {}, title), el('pre', { class: 'dp-code', text: value }));
       return detail;
+    }
+
+    function help(box, id) {
+      const source = q(id);
+      if (!source) return;
+      const copy = source.cloneNode(true);
+      for (const br of all('br', copy)) br.replaceWith('\n');
+      const text = copy.textContent.trim();
+      if (text) box.body.append(sourceView('Pomoc z tego formularza Darro', text));
     }
 
     function removeRow(entry, row, refresh) {
@@ -2632,7 +3825,11 @@
             initial,
             spec[1] === 'number' && /^-?\d+(\.\d+)?$/.test(initial) ? 'number' : 'text'
           );
-        const row = el('div', { class: 'dp-card' }, field(spec[0], control, part.key));
+        const row = el(
+          'div',
+          { class: 'dp-card' },
+          field(spec[0], control, hints[part.key] || 'Parametr w stat: ' + part.key + '.')
+        );
         part.read = () => {
           if (part.removed || (spec[1] === 'flag' && !control.checked)) return null;
           if (spec[1] === 'flag') return part.raw;
@@ -2679,6 +3876,7 @@
         rows,
         el('div', { class: 'dp-row' }, field('Nowy parametr', choice), add)
       );
+      help(box, '#hideInfo1');
       if (unknown.length)
         box.body.append(
           sourceView(
@@ -2847,7 +4045,7 @@
         eat.focus();
         return;
       }
-      const box = modal('Działania po użyciu przedmiotu');
+      const box = modal('Działania i ważność przedmiotu');
       const rows = el('div', { class: 'dp-stack' }),
         preview = el('pre', { class: 'dp-code' }),
         status = el('p', { class: 'dp-help' });
@@ -2912,13 +4110,27 @@
               el(
                 'p',
                 { class: 'dp-help' },
-                'Według pomocy panelu przedmiot wygasa o północy po upływie podanej liczby dni od otrzymania.'
+                'Termin liczony od otrzymania, nie od użycia: przedmiot wygasa o północy po podanej liczbie dni.'
               )
             );
           if (spec[1] === 'hours')
-            row.append(el('p', { class: 'dp-help' }, 'Czas liczony od otrzymania przedmiotu.'));
+            row.append(
+              el(
+                'p',
+                { class: 'dp-help' },
+                'Termin liczony od otrzymania, nie od użycia: przedmiot wygasa po podanej liczbie godzin.'
+              )
+            );
           if (spec[1] === 'number')
             row.append(el('p', { class: 'dp-help' }, 'Liczba dodatnia dodaje walutę, ujemna ją odejmuje.'));
+          if (spec[1] === 'npc')
+            row.append(
+              el(
+                'p',
+                { class: 'dp-help' },
+                'Pomoc panelu wymaga numeru żywego NPC. Wybranie numeru tutaj ustawia tylko cel rozmowy w JSON.'
+              )
+            );
           control.addEventListener('input', refresh);
         }
         removeRow(part, row, refresh);
@@ -2954,11 +4166,12 @@
         el(
           'p',
           { class: 'dp-help' },
-          'Kreator uzupełnia pole JSON. Podgląd nie wykonuje działań przedmiotu.'
+          'JSON zawiera działania po użyciu oraz ustawienia ważności liczone od otrzymania. Wybierz potrzebną czynność; podgląd jej nie wykonuje.'
         ),
         rows,
         el('div', { class: 'dp-row' }, field('Nowe działanie', choice), add)
       );
+      help(box, '#hideInfo2');
       if (unknown.length)
         box.body.append(
           sourceView(
@@ -3207,11 +4420,12 @@
     const integer = (value) => /^-?\d+$/.test(String(value)) && Number.isSafeInteger(Number(value));
     const native = (control) =>
       control &&
+      control.matches('input:not([type="hidden"]):not([type="password"]), select, textarea') &&
       !app.root.contains(control) &&
       !control.closest('#backLogin, .dp-tools') &&
       app.check(control);
     const title = {
-      item: 'przedmiot',
+      item: 'szablon przedmiotu',
       npc: 'NPC',
       mob: 'potwora',
       map: 'mapę',
@@ -3221,23 +4435,89 @@
     const selected = (control) => Array.from(control.selectedOptions, (option) => option.value);
     const enabled = (option) => !option.disabled && !option.closest('optgroup[disabled]');
     const path = app.path || location.pathname;
+    const route = (name) => new RegExp('(?:^|/)' + name + '(?:,|/|$)').test(path);
+    const action = (control) =>
+      control.form ? q('input[type="hidden"][name="t"]', control.form)?.value || '' : '';
+    const post = (control) => control.form?.method.toLowerCase() === 'post';
+    const shared = (value) => integer(value) && Number(value) === 1;
+    const grant = (control) =>
+      post(control) &&
+      ((route('currency2?') && action(control) === 'editcurr') || /(?:^|\/)items\/base\/-1\/?$/.test(path));
+    const picture = (record, size = 40) =>
+      app.media?.node(record, { size }) || el('span', { class: 'dp-media', text: 'Brak grafiki' });
+    let serial = 0;
+
+    function hint(control, message, bar) {
+      if (!control || control.dataset.dpPanelHelp) return null;
+      const id = 'dp-panel-help-' + ++serial;
+      const help = el('span', { class: 'dp-help', id, text: message });
+      control.dataset.dpPanelHelp = id;
+      control.setAttribute(
+        'aria-describedby',
+        [control.getAttribute('aria-describedby'), id].filter(Boolean).join(' ')
+      );
+      if (bar) bar.append(help);
+      else {
+        const group = control.closest('.form-group');
+        if (group) group.append(el('p', {}, help));
+        else control.after(help);
+      }
+      return help;
+    }
+
+    function preview(control, kind, bar) {
+      const status = el('span', { class: 'dp-row dp-help', 'aria-live': 'polite' });
+      const records = new Map();
+      bar.append(status);
+      const update = () => {
+        const options =
+          control.tagName === 'SELECT'
+            ? Array.from(control.selectedOptions).filter((option) => option.value)
+            : control.value
+              ? [{ value: control.value, textContent: '' }]
+              : [];
+        status.replaceChildren();
+        if (control.multiple) status.append(el('span', { text: `Wybrano: ${options.length}` }));
+        for (const option of options.slice(0, control.multiple ? 3 : 1)) {
+          const record = records.get(option.value) || { id: option.value };
+          if (kind) status.append(picture(record));
+          status.append(el('span', { text: text(option.textContent) || record.name || `#${option.value}` }));
+        }
+        if (control.multiple && options.length > 3)
+          status.append(el('span', { text: `i ${options.length - 3} więcej` }));
+      };
+      control.addEventListener('input', update);
+      control.addEventListener('change', update);
+      update();
+      if (kind)
+        app
+          .list(kind)
+          .then((values) => {
+            if (!control.isConnected) return;
+            for (const record of values) records.set(String(record.id), record);
+            update();
+          })
+          .catch(() => {});
+      return (record) => {
+        records.set(String(record.id), record);
+        update();
+      };
+    }
 
     function name(id, scope, names) {
       return app.aliases()[`${scope}:${id}`]?.name || names?.get(String(id)) || `Progress #${id}`;
     }
 
-    function choice(control, kind, label, labels) {
+    function choice(control, kind, label, labels, help = '') {
       if (!native(control)) return;
       const start = selected(control);
       const values = new Set(start);
-      const entries = Array.from(control.options)
-        .filter((option) => option.value || text(option.textContent))
-        .map((option) => ({
-          value: option.value,
-          label: labels?.get(option.value) || text(option.textContent) || 'Puste',
-          group: option.parentElement.tagName === 'OPTGROUP' ? option.parentElement.label : '',
-          disabled: !enabled(option)
-        }));
+      const entries = Array.from(control.options).map((option) => ({
+        value: option.value,
+        label: labels?.get(option.value) || text(option.textContent) || 'Brak wyboru',
+        group: option.parentElement.tagName === 'OPTGROUP' ? option.parentElement.label : '',
+        disabled: !enabled(option)
+      }));
       const groups = [...new Set(entries.map((entry) => entry.group).filter(Boolean))];
       const dialog = modal(label);
       const search = el('input', {
@@ -3249,13 +4529,14 @@
       const group = select([['', 'Wszystkie grupy'], ...groups.map((value) => [value, value])]);
       const count = el('p', { class: 'dp-help', 'aria-live': 'polite' });
       const area = el('div', { class: 'dp-list' });
-      const images = new Map();
+      const records = new Map();
       let alive = true;
       const close = dialog.close;
       dialog.close = () => {
         alive = false;
         close();
       };
+      if (help) dialog.body.append(el('p', { class: 'dp-help', text: help }));
       dialog.body.append(field('Znajdź', search));
       if (groups.length > 1) dialog.body.append(field('Grupa', group));
       dialog.body.append(count, area);
@@ -3297,8 +4578,7 @@
           row.disabled = entry.disabled;
           row.setAttribute('aria-pressed', String(values.has(entry.value)));
           if (values.has(entry.value)) row.classList.add('dp-primary');
-          const src = images.get(entry.value);
-          if (src) row.append(el('img', { src, alt: '', loading: 'lazy', referrerpolicy: 'no-referrer' }));
+          if (kind && entry.value) row.append(picture(records.get(entry.value) || { id: entry.value }));
           row.append(
             el(
               'span',
@@ -3331,31 +4611,47 @@
       if (kind)
         app
           .list(kind)
-          .then((records) => {
+          .then((values) => {
             if (!alive || !dialog.box.isConnected) return;
-            for (const record of records) if (record.src) images.set(String(record.id), record.src);
+            for (const record of values) records.set(String(record.id), record);
             for (const row of area.children) {
-              const src = images.get(row.dataset.dpValue);
-              if (src && !q('img', row))
-                row.prepend(el('img', { src, alt: '', loading: 'lazy', referrerpolicy: 'no-referrer' }));
+              const record = records.get(row.dataset.dpValue);
+              if (record) q('.dp-media', row)?.replaceWith(picture(record));
             }
           })
           .catch(() => {});
       search.focus();
     }
 
-    function chooseValue(id, value, scope, done) {
+    function chooseValue(id, value, scope, done, help = '') {
       const dialog = modal('Wybierz wartość progresu');
       const input = el('input', { class: 'dp-input', type: 'number', step: '1', value });
       const area = el('div', { class: 'dp-list' });
+      const mark = () => {
+        for (const node of all('[data-dp-stage]', area)) {
+          const active = !node.disabled && node.dataset.dpStage === input.value;
+          node.classList.toggle('dp-primary', active);
+          node.setAttribute('aria-pressed', String(active));
+        }
+      };
+      input.addEventListener('input', mark);
       const info = el('p', {
         class: 'dp-help',
         text:
           scope === 'global'
             ? 'Wartość wspólna dla świata. Wpisz konkretną liczbę całkowitą.'
-            : 'Wybierz nazwany etap albo wpisz konkretną liczbę całkowitą.'
+            : 'Nazwy etapów pochodzą z opisu questa powiązanego z tym numerem. Progress może też być licznikiem bez nazwanych etapów.'
       });
-      dialog.body.append(info, field('Wartość', input), area);
+      dialog.body.append(info);
+      if (help) dialog.body.append(el('p', { class: 'dp-help', text: help }));
+      dialog.body.append(
+        field(
+          'Dokładna wartość',
+          input,
+          'Zakres etapu opisuje kilka wartości. Aby ustawić konkretny stan, wpisz jedną liczbę całkowitą.'
+        ),
+        area
+      );
       dialog.foot.append(
         button('Anuluj', () => dialog.close()),
         button(
@@ -3379,10 +4675,10 @@
               const range = stage.range || !integer(stage.value);
               const row = button('', () => {
                 input.value = stage.value;
-                for (const node of area.children) node.classList.remove('dp-primary');
-                row.classList.add('dp-primary');
+                mark();
               });
               row.classList.add('dp-item');
+              row.dataset.dpStage = stage.value;
               row.disabled = range;
               row.append(
                 el(
@@ -3400,6 +4696,7 @@
               if (!range && String(stage.value) === String(value)) row.classList.add('dp-primary');
               area.append(row);
             }
+            mark();
             if (!stages.length)
               area.append(
                 el('p', {
@@ -3434,7 +4731,7 @@
       dialog.body.append(
         el('p', {
           class: 'dp-help',
-          text: 'Każdy zakup zwiększa wskazany progress o 1, niezależnie od liczby sztuk. To efekt zakupu, a nie warunek dostępności oferty.'
+          text: 'Reguły zwiększają progress o 1 po zakupie tego przedmiotu, niezależnie od kupionej liczby sztuk. Warunek określa, kiedy zwiększyć progress; nie ogranicza dostępności oferty.'
         }),
         area
       );
@@ -3444,7 +4741,7 @@
           const card = el('div', { class: 'dp-card dp-stack' });
           if (!row.id) {
             card.append(
-              el('strong', { text: 'Własny zapis — zachowany bez zmian' }),
+              el('strong', { text: 'Nierozpoznany zapis — zachowany bez zmian' }),
               el('code', { class: 'dp-code', text: row.raw || '(pusty wpis)' })
             );
           } else {
@@ -3469,10 +4766,16 @@
               value: row.value === '?' ? '' : row.value
             });
             const stage = button('Wybierz etap', () =>
-              chooseValue(row.id, value.value, row.scope, (number) => {
-                value.value = number;
-                row.value = number;
-              })
+              chooseValue(
+                row.id,
+                value.value,
+                row.scope,
+                (number) => {
+                  value.value = number;
+                  row.value = number;
+                },
+                'To obecna wartość, przy której zakup ma zwiększyć progress o 1. Nie jest to wartość nadawana po zakupie.'
+              )
             );
             const choose = button(
               `${name(row.id, row.scope, row.scope === 'player' ? names : null)} · #${row.id}`,
@@ -3507,9 +4810,17 @@
             });
             card.append(
               field('Progress', choose),
-              field('Zakres', scope),
+              field(
+                'Czyj progress',
+                scope,
+                'Gracz ma własną wartość. Progress wspólny dotyczy całego świata.'
+              ),
               field('Kiedy zwiększać o 1', mode),
-              field('Obecna wartość', value),
+              field(
+                'Wymagana obecna wartość',
+                value,
+                'Przy dokładnej wartości zwiększenie nastąpi tylko wtedy, gdy progress ma tę wartość.'
+              ),
               stage
             );
             sync();
@@ -3591,22 +4902,14 @@
         .catch(() => {});
     }
 
-    function picker(control, kind, label) {
+    function picker(control, spec) {
       if (!native(control)) return;
-      const bar = tools(control, [
-        [label || `Wybierz ${title[kind]}`, () => choice(control, kind, label || `Wybierz ${title[kind]}`)]
-      ]);
+      const { kind, help, labels } = spec;
+      const label = spec.label || `Wybierz ${title[kind]}`;
+      const bar = tools(control, [[label, () => choice(control, kind, label, labels, help)]]);
       if (!bar) return;
-      const status = el('span', { class: 'dp-help' });
-      bar.append(status);
-      const update = () => {
-        const names = Array.from(control.selectedOptions)
-          .filter((option) => option.value)
-          .map((option) => text(option.textContent));
-        status.textContent = control.multiple ? `Wybrano: ${names.length}` : names[0] || '';
-      };
-      control.addEventListener('change', update);
-      update();
+      if (help) hint(control, help, bar);
+      preview(control, kind, bar);
     }
 
     const progress = path.match(/(?:^|\/)progress\/(-?\d+)(?:\/|$)/);
@@ -3614,21 +4917,49 @@
       const id = progress[1];
       for (const input of all('input[name="value"], #bulk_to', main)) {
         if (!native(input)) continue;
-        tools(input, [
+        const form = input.form;
+        const state = post(input) && q('input[type="hidden"][name="progress_set"][value="1"]', form);
+        const bulk =
+          post(input) &&
+          input.id === 'bulk_to' &&
+          form.id === 'progress_bulk' &&
+          q('input[type="hidden"][name="progress_bulk"][value="1"]', form);
+        const search = input.id === 'value' && form?.method.toLowerCase() === 'get';
+        if (!state && !bulk && !search) continue;
+        const help = search
+          ? 'Wybierasz dokładną wartość do wyszukania. Puste pole pokazuje wszystkie wartości; wyszukiwanie uruchamia „Szukaj”.'
+          : bulk
+            ? 'Ta liczba zastąpi wartość u grupy wskazanej w formularzu. Opisy etapów dotyczą questa gracza powiązanego z tym numerem.'
+            : 'Wybierz nową wartość i użyj „Zapisz” dla tego konta. Aid 1 oznacza wspólną wartość świata.';
+        const bar = tools(input, [
           [
             'Wybierz etap',
             () => {
-              const aid = q('[name="aid"]', input.form || main)?.value;
-              chooseValue(id, input.value, aid === '1' ? 'global' : 'player', (value) => set(input, value));
+              const aid = q('[name="aid"]', form)?.value;
+              chooseValue(
+                id,
+                input.value,
+                shared(aid) ? 'global' : 'player',
+                (value) => set(input, value),
+                help
+              );
             }
           ]
         ]);
+        if (bar) hint(input, help, bar);
       }
       const from = q('#bulk_from', main);
-      if (native(from))
-        tools(from, [
+      if (
+        native(from) &&
+        post(from) &&
+        from.form.id === 'progress_bulk' &&
+        q('input[type="hidden"][name="progress_bulk"][value="1"]', from.form)
+      ) {
+        const help =
+          'Zmiana obejmuje istniejące wpisy progresu z wybraną wartością. „Każda” oznacza wszystkie zapisane wartości tego progresu, a nie wszystkie konta świata.';
+        const bar = tools(from, [
           [
-            'Wybierz etap początkowy',
+            'Wybierz wartość początkową',
             async () => {
               let stages = [];
               try {
@@ -3637,27 +4968,64 @@
               const labels = new Map();
               for (const option of from.options) {
                 const stage = stages.find((stage) => !stage.range && String(stage.value) === option.value);
-                if (stage) labels.set(option.value, `${stage.label} · ${text(option.textContent)}`);
+                if (stage)
+                  labels.set(option.value, `${text(option.textContent)} · opis questa: ${stage.label}`);
               }
-              choice(from, null, 'Grupa do zmiany', labels);
+              choice(from, null, 'Grupa do zmiany', labels, help);
             }
           ]
         ]);
+        if (bar) {
+          const status = hint(from, help, bar);
+          const update = () => {
+            const count = from.selectedOptions[0]?.dataset.count;
+            if (status)
+              status.textContent =
+                help +
+                (/^\d+$/.test(count || '')
+                  ? ` Panel wskazuje ${count} graczy i poprosi o potwierdzenie tej liczby przed zapisem.`
+                  : ' Sprawdź liczbę graczy w potwierdzeniu panelu przed zapisem.');
+          };
+          from.addEventListener('change', update);
+          update();
+        }
+      }
       for (const input of all('#set_aid, #log_aid', main)) {
         if (!native(input)) continue;
+        const log = input.id === 'log_aid' && input.form?.method.toLowerCase() === 'get';
+        const state =
+          input.id === 'set_aid' &&
+          post(input) &&
+          q('input[type="hidden"][name="progress_set"][value="1"]', input.form);
+        if (!log && !state) continue;
         const bar = tools(input, [
-          ['Wybierz gracza', () => pick('player', (record) => set(input, record.id))],
+          [
+            'Wybierz gracza',
+            () =>
+              pick('player', (record) => {
+                if (!integer(record.id)) return note('To konto nie ma poprawnego numeru.', 'error');
+                set(input, record.id);
+              })
+          ],
           ['Wspólny dla świata', () => set(input, '1')]
         ]);
         if (bar) {
+          hint(
+            input,
+            log
+              ? 'Filtr historii po numerze konta. Aid 1 pokazuje wpisy wartości wspólnej; puste pole obejmuje wszystkie konta w historii.'
+              : 'To numer konta gracza (Aid). Wartość 1 oznacza jeden progress wspólny dla całego świata.',
+            bar
+          );
           const status = el('span', { class: 'dp-help' });
           bar.append(status);
           const update = () => {
-            status.textContent =
-              input.value === '1'
-                ? 'Wartość wspólna dla całego świata'
-                : input.value
-                  ? `Konto #${input.value}`
+            status.textContent = shared(input.value)
+              ? 'Wartość wspólna dla całego świata'
+              : input.value
+                ? `Konto #${input.value}`
+                : log
+                  ? 'Historia wszystkich kont'
                   : 'Wybierz konto lub wartość wspólną';
           };
           input.addEventListener('input', update);
@@ -3668,62 +5036,140 @@
     }
 
     const prog = q('#prog[name="prog"]', main);
-    if (/(?:^|\/)shop(?:\/|$)/.test(path) && native(prog))
-      tools(prog, [['Ustaw reguły zakupu', () => shop(prog)]]);
+    if (route('shop') && native(prog) && post(prog) && action(prog) === 'editshop') {
+      const bar = tools(prog, [['Ustaw progress po zakupie', () => shop(prog)]]);
+      if (bar)
+        hint(
+          prog,
+          'Po transakcji zakupu progress rośnie o 1, niezależnie od liczby sztuk. Warunek dotyczy zwiększenia progresu, a nie możliwości kupienia. Puste pole wyłącza ten efekt.',
+          bar
+        );
+    }
 
-    const find = q('#find[list="quest_list"]', main);
-    if (native(find))
-      tools(find, [['Wybierz progress', () => pick('progress', (record) => set(find, record.id))]]);
-    if (/(?:^|\/)quest(?:,|\/|$)/.test(path)) {
+    const find = q('#find[name="find"][list="quest_list"]', main);
+    if (route('progress') && native(find) && find.form?.method.toLowerCase() === 'get') {
+      const bar = tools(find, [
+        ['Wybierz progress', () => pick('progress', (record) => set(find, record.id))]
+      ]);
+      if (bar)
+        hint(
+          find,
+          'Wstaw numer, a następnie użyj „Otwórz”, aby zobaczyć zapisane wartości tego progresu.',
+          bar
+        );
+    }
+    if (route('quest')) {
       const input = q('#id[name="id"]', main);
-      if (native(input))
-        tools(input, [['Wybierz quest', () => pick('quest', (record) => set(input, record.id))]]);
+      if (native(input)) {
+        const bar = tools(input, [['Wybierz quest', () => pick('quest', (record) => set(input, record.id))]]);
+        if (bar) hint(input, 'Wstaw numer questa, a następnie użyj „Przejdź do edycji”.', bar);
+      }
+    }
+
+    function kind(control) {
+      const nav = [
+        ['chosen-npc', 'npc'],
+        ['chosen-mob', 'mob'],
+        ['chosen-template', 'item'],
+        ['chosen-shop', 'shop'],
+        ['chosen-map', 'map']
+      ].find(([cls]) => control.classList.contains(cls));
+      if (nav)
+        return {
+          kind: nav[1],
+          label: `Otwórz ${title[nav[1]]}`,
+          help: 'Wybranie pozycji od razu przenosi do jej strony w panelu.'
+        };
+      if (control.classList.contains('chosen-map-with-id') || control.hasAttribute('mapsel'))
+        return {
+          kind: 'map',
+          help: 'Wybierz mapę dostępną w tym polu. Zapis wykonaj przyciskiem formularza.'
+        };
+      const type = action(control);
+      if (route('shop') && post(control) && control.name === 'tid') {
+        if (type === 'editshop' && control.id === 'tid')
+          return {
+            kind: 'item',
+            help: 'Szablon przedmiotu sprzedawanego w wybranym miejscu sklepu. Puste pole usuwa tę ofertę po zapisaniu.',
+            labels: new Map([['', 'Puste pole — usuń ofertę po zapisaniu']])
+          };
+        if (type === 'shopbuy' && control.id === 'buy_tid')
+          return {
+            kind: 'item',
+            label: 'Wybierz szablon do skupu',
+            help: 'Gracz może sprzedać sklepowi przedmiot z tego szablonu. Ponowne dodanie tego samego szablonu zmienia jego cenę skupu.'
+          };
+      }
+      if (grant(control) && control.name === 'template' && control.classList.contains('chosen-template-any'))
+        return {
+          kind: 'item',
+          help: 'Wybrany szablon zostanie przyznany do torby gracza. Numer 0 tworzy pusty przedmiot do ręcznej edycji.'
+        };
+      if (grant(control) && control.name === 'aids[]' && control.classList.contains('chosen-players2'))
+        return {
+          kind: 'player',
+          label: 'Wybierz graczy',
+          help: 'Wybierasz konta odbiorców z listy udostępnionej w tym formularzu.'
+        };
+      if (route('award') && post(control) && type === 'award' && control.name === 'players[]')
+        return {
+          kind: 'player',
+          label: 'Wybierz graczy',
+          help: 'Te konta otrzymają nagrodę wybraną w formularzu. Przyznanie wykonaj przyciskiem strony.'
+        };
+      if (
+        route('items') &&
+        post(control) &&
+        ['newtemplate', 'edittemplate', 'edititem'].includes(type) &&
+        control.name === 'cl' &&
+        control.id === 'cl'
+      )
+        return {
+          kind: null,
+          label: 'Wybierz klasę przedmiotu',
+          help: 'Klasa określa rodzaj przedmiotu. Lista zachowuje wartości udostępnione przez formularz.'
+        };
+      return null;
     }
 
     for (const control of all('select', main)) {
       if (!native(control) || control.id === 'bulk_from' || control.id === 'log_src') continue;
-      const cls = control.classList;
-      let kind = null;
-      if (cls.contains('chosen-npc')) kind = 'npc';
-      else if (cls.contains('chosen-mob')) kind = 'mob';
-      else if (cls.contains('chosen-shop')) kind = 'shop';
-      else if (
-        cls.contains('chosen-map') ||
-        cls.contains('chosen-map-with-id') ||
-        control.hasAttribute('mapsel')
-      )
-        kind = 'map';
-      else if (
-        ['tid', 'template'].includes(control.name) ||
-        cls.contains('chosen-template') ||
-        cls.contains('chosen-template-any')
-      )
-        kind = 'item';
-      else if (['aids[]', 'players[]'].includes(control.name) || cls.contains('chosen-players2'))
-        kind = 'player';
-      if (kind) picker(control, kind);
-      else if (control.name === 'cl') picker(control, null, 'Wybierz klasę przedmiotu');
+      const spec = kind(control);
+      if (spec) picker(control, spec);
     }
 
     for (const input of all('input[name="map_id"]', main)) {
-      if (!native(input)) continue;
-      tools(input, [
+      if (!native(input) || !route('npc') || !post(input) || !['add_npc', 'npc1'].includes(action(input)))
+        continue;
+      let show;
+      const bar = tools(input, [
         [
           'Wybierz mapę',
           () =>
             pick('map', (record) => {
               if (!integer(record.id)) return note('Ta mapa nie ma poprawnego numeru.', 'error');
               if (set(input, record.id) === false) return;
-              const name = q('[name="map_name"]', input.form || input.parentElement);
-              if (native(name) && record.name) set(name, record.name);
+              const name = q('[name="map_name"]', input.form);
+              const known = record.name && ![String(record.id), `#${record.id}`].includes(text(record.name));
+              if (native(name) && known) set(name, record.name);
+              else if (!known) note('Wstawiono numer mapy. Uzupełnij jej nazwę i sprawdź współrzędne NPC.');
+              show?.(record);
             })
         ]
       ]);
+      if (bar) {
+        hint(
+          input,
+          'Wybór uzupełnia ID i znaną nazwę mapy. Pozycję NPC na tej mapie określ osobno w polach x i y.',
+          bar
+        );
+        show = preview(input, 'map', bar);
+      }
     }
 
     for (const input of all('textarea[name="aids_text"]', main)) {
-      if (!native(input)) continue;
-      tools(input, [
+      if (!native(input) || !grant(input)) continue;
+      const bar = tools(input, [
         [
           'Dodaj gracza',
           () =>
@@ -3731,11 +5177,37 @@
               if (!integer(record.id)) return note('To konto nie ma poprawnego numeru.', 'error');
               const lines = input.value.split(/\r?\n/).map((value) => value.trim());
               if (lines.includes(String(record.id)))
-                return note('Ten numer konta jest już na liście. Powtórzenie możesz wpisać ręcznie.');
+                return note(
+                  'Ten numer konta jest już na liście. Każde powtórzenie oznacza osobne przyznanie; możesz dopisać je ręcznie.'
+                );
               set(input, input.value + (input.value && !input.value.endsWith('\n') ? '\n' : '') + record.id);
             })
         ]
       ]);
+      if (bar)
+        hint(
+          input,
+          'Każdy numer konta lub link do profilu oznacza osobne przyznanie. Powtórzenie konta powtarza przyznanie.',
+          bar
+        );
+    }
+
+    if (route('shop')) {
+      for (const input of all('input[name="pr"], input[name="amount"], input[name="curr_tid"]', main)) {
+        if (!native(input) || !post(input)) continue;
+        const type = action(input);
+        if (type === 'editshop' && input.name === 'pr')
+          hint(input, 'Cena oferty w walucie ustawionej dla tego sklepu.');
+        if (type === 'editshop' && input.name === 'amount')
+          hint(input, 'Wartość 0 tworzy nowy przedmiot w ekwipunku kupującego.');
+        if (type === 'shopbuy' && input.name === 'pr')
+          hint(
+            input,
+            'Tyle gracz otrzyma za każdą sprzedaną sztukę. To cena skupu, wypłacana w walucie sklepu.'
+          );
+        if (type === 'editshopbase' && input.name === 'curr_tid')
+          hint(input, 'ID szablonu używanego jako waluta przy wybranej opcji „Przedmiot”.');
+      }
     }
 
     function filter(target, rows, label) {
@@ -3746,6 +5218,7 @@
         placeholder: label,
         'aria-label': label
       });
+      input.title = 'Filtruje wyłącznie pozycje wczytane na tej stronie.';
       const count = el('span', { class: 'dp-help', 'aria-live': 'polite' });
       const bar = el('div', { class: 'dp-tools' }, input, count);
       target.before(bar);
